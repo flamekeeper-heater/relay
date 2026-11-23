@@ -421,18 +421,22 @@ describe('LIVE to Live Activity pushes', () => {
     expect(await row(b.id, 1)).toBeUndefined();
   });
 
-  it('drops a LIVE within 20 s of the last; an end always passes', async () => {
+  it('drops a LIVE within 5 s of the last, passes one 5 s after; an end always passes', async () => {
     const b = await board();
     await registered(b, { startToken: START_1, activityToken: CARD_1 });
     const sender = await fakeSender(b.id);
     b.send(live(1, [[1, blob(1)]]));
     await eventually(async () => (await sender.items()).length === 1);
-    await at(b, NOW + 19_999);
+    await at(b, NOW + 4_999);
     b.send(live(1, [[1, blob(2)]]));
-    await at(b, NOW + 20_000);
-    b.send(live(2, [[1, blob(3)]]));
+    await at(b, NOW + 5_000);
+    b.send(live(1, [[1, blob(3)]]));
     await eventually(async () => (await sender.items()).length === 2);
-    expect(aps((await sender.items())[1]).event).toBe('end');
+    expect(aps((await sender.items())[1])['content-state'].sealed).toBe(b64(blob(3)));
+    await at(b, NOW + 5_001);
+    b.send(live(2, [[1, blob(4)]]));
+    await eventually(async () => (await sender.items()).length === 3);
+    expect(aps((await sender.items())[2]).event).toBe('end');
   });
 
   it('ignores a malformed LIVE and keeps the board; logs carry no blob', async () => {

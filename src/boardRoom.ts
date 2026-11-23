@@ -505,7 +505,7 @@ export class BoardRoom extends DurableObject<Env> {
 
   /**
    * A LIVE from the signed-in board: per phone it sealed a record for, an update to its card, a
-   * push-to-start, or the card's end (`liveRequests`). At most one per 20 s; an end always passes.
+   * push-to-start, or the card's end (`liveRequests`). At most one per 5 s (the board keeps its own 20 s for small changes); an end always passes.
    * Each phone's last blob is kept for the lost-contact update and the 8-hour renewal.
    */
   private async boardLive(m: Uint8Array): Promise<void> {

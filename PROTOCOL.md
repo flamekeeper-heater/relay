@@ -75,7 +75,7 @@ the board gets CLOSE with the same code (1000 when the phone closed).
 | Message size | 2048 bytes from the board, 2047 from a phone |
 | Phone → board | 400 messages a second per channel on average, bursts of 128 |
 | PUSH | 20 an hour per board, then dropped; class 3 is never limited |
-| LIVE | one update per 20 s per board, then dropped; a start or an end always passes |
+| LIVE | one update per 5 s per board, then dropped; a start or an end always passes |
 | Stored state | deleted with the board after 90 days unseen |
 
 ## Push registrations
