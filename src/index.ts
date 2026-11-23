@@ -3,10 +3,13 @@
 // A phone's push registration call (`/v1/app/<id>/push`, plain HTTP) goes to the same object.
 
 import { BoardRoom } from './boardRoom';
+import { PushSender } from './push/pushSender';
 import { SUBPROTOCOL, parsePath } from './wire';
 
 export interface Env {
   BOARD: DurableObjectNamespace<BoardRoom>;
+  /** The one APNs sender (named "apns"). */
+  PUSH: DurableObjectNamespace<PushSender>;
   BOARD_CONNECTS: RateLimit;
   APP_CONNECTS: RateLimit;
   /** The app's bundle id, the APNs topic. */
@@ -64,4 +67,4 @@ export async function handle(request: Request, env: Env): Promise<Response> {
 }
 
 export default { fetch: handle } satisfies ExportedHandler<Env>;
-export { BoardRoom };
+export { BoardRoom, PushSender };

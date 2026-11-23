@@ -16,7 +16,7 @@ async function boardRoom(): Promise<Room> {
   const board = await fakeBoard();
   await board.signIn();
   board.roster(await Promise.all(tokens.map(async (t, slot) => [slot, await sha256(t)] as [number, Uint8Array])));
-  expect(toHex(await board.next())).toBe('00080000'); // WANT, after the roster is stored
+  expect(toHex(await board.next())).toBe('0008000000'); // WANT, after the roster is stored
   expect((await rows(board.id, 'roster')).length).toBe(8);
   return { board, tokens };
 }

@@ -27,7 +27,7 @@ async function awayWith(after1: number | null, after2: number) {
     [1, await sha256(T1)],
     [2, H],
   ]);
-  expect(toHex(await b.next())).toBe('00080000');
+  expect(toHex(await b.next())).toBe('0008000000');
   if (after1 !== null) {
     expect((await register(b.id, T1, { env: 'production', device: DEVICE_1, offlineAfter: after1 })).status).toBe(204);
     await b.next();
@@ -39,7 +39,7 @@ async function awayWith(after1: number | null, after2: number) {
   b.ws.close(1000);
   await b.closed;
   await eventually(async () => (await rows(b.id, 'meta'))[0]?.value === T0 / 1000);
-  return { b, sender, mask: after1 === null ? '00080400' : '00080600' };
+  return { b, sender, mask: after1 === null ? '0008040000' : '0008060000' };
 }
 
 /** Runs the room's alarm at `ms`, whatever time it was set for. */

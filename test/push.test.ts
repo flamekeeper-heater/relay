@@ -59,12 +59,12 @@ async function boardWithPhones(): Promise<FakeBoardSocket> {
     [1, await sha256(T1)],
     [2, H],
   ]);
-  expect(toHex(await b.next())).toBe('00080000');
+  expect(toHex(await b.next())).toBe('0008000000');
   await setClock(b.id, NOW);
   expect((await register(b.id, T1, { env: 'production', device: DEVICE_1 })).status).toBe(204);
-  expect(toHex(await b.next())).toBe('00080200');
+  expect(toHex(await b.next())).toBe('0008020000');
   expect((await register(b.id, T, { env: 'sandbox', device: DEVICE_2 })).status).toBe(204);
-  expect(toHex(await b.next())).toBe('00080600');
+  expect(toHex(await b.next())).toBe('0008060000');
   return b;
 }
 
@@ -176,7 +176,7 @@ describe('PUSH fan-out', () => {
   it('skips a slot whose registration has no device', async () => {
     const b = await boardWithPhones();
     expect((await register(b.id, T1, { device: null })).status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080400');
+    expect(toHex(await b.next())).toBe('0008040000');
     const sender = await fakeSender(b.id);
     b.send(pushMessage(1, [[1, blob(1)], [2, blob(2)]]));
     await eventually(async () => (await sender.items()).length === 1);
@@ -201,7 +201,7 @@ describe('PUSH fan-out', () => {
     const b = await boardWithPhones();
     const sender = await fakeSender(b.id, (i) => (i.device === DEVICE_1 ? 'gone' : 'sent'));
     b.send(pushMessage(1, [[1, blob(1)], [2, blob(2)]]));
-    expect(toHex(await b.next())).toBe('00080400');
+    expect(toHex(await b.next())).toBe('0008040000');
     expect((await rows(b.id, 'push')).map((r) => r.slot)).toEqual([2]);
     expect((await sender.items()).length).toBe(2);
   });
@@ -259,14 +259,14 @@ describe('PUSH fan-out', () => {
     const b = await fakeBoard({ via: stub });
     await b.signIn();
     b.roster([[2, H]]);
-    expect(toHex(await b.next())).toBe('00080000');
+    expect(toHex(await b.next())).toBe('0008000000');
     const r = await stub.fetch(`https://relay.flamekeeper.app/v1/app/${b.id}/push`, {
       method: 'PUT',
       headers: { Authorization: `Bearer ${btoa(String.fromCharCode(...T)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}` },
       body: JSON.stringify({ env: 'sandbox', device: DEVICE_2 }),
     });
     expect(r.status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080400');
+    expect(toHex(await b.next())).toBe('0008040000');
     const sent: unknown[] = [];
     await runInDurableObject(stub, (o: BoardRoom) => {
       o.pushSender = async (items) => {
@@ -317,11 +317,12 @@ describe('PUSH fan-out', () => {
     }
   });
 
-  it('without an APNs sender every item fails and the log says push not available', async () => {
+  it('with an APNs key that does not import every item fails and the log says so', async () => {
     const log = vi.spyOn(console, 'log');
     const b = await boardWithPhones();
     b.send(pushMessage(1, [[2, blob(2)]]));
-    await eventually(() => log.mock.calls.some((c) => c.join(' ').includes('push not available')));
+    await eventually(() => log.mock.calls.some((c) => c.join(' ').includes('apns key unusable')));
+    await eventually(() => log.mock.calls.some((c) => c.join(' ').includes('push: 0 sent, 0 gone, 1 failed')));
     expect((await rows(b.id, 'push')).length).toBe(2);
     expect(await b.quiet()).toBe(true);
   });

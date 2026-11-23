@@ -23,7 +23,7 @@ describe('board sign-in', () => {
     const b = await fakeBoard();
     const c = await b.next();
     b.send(await b.auth(c.subarray(2)));
-    expect(toHex(await b.next())).toBe('00080000');
+    expect(toHex(await b.next())).toBe('0008000000');
     expect(await b.quiet()).toBe(true);
   });
 

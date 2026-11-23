@@ -136,7 +136,7 @@ export async function fakeBoard(
     publicKey,
     keys,
     auth,
-    async signIn(expected = '00080000') {
+    async signIn(expected = '0008000000') {
       const c = await s.next();
       if (c[0] !== 0 || c[1] !== Op.challenge || c.length !== 34) throw new Error('expected CHALLENGE');
       s.send(await auth(c.subarray(2)));

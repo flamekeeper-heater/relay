@@ -1,5 +1,6 @@
 // What the relay hands the APNs sender: one item per phone, already shaped as Apple wants it.
 
+import type { PushType } from './apns';
 import type { ApnsEnv } from './registry';
 
 /** The JSON body of one APNs request. */
@@ -7,8 +8,10 @@ export type ApnsPayload = Record<string, unknown>;
 
 export interface ApnsItem {
   env: ApnsEnv;
-  /** The device token, lowercase hex. */
+  /** The device token (or a Live Activity's push-to-start or update token), lowercase hex. */
   device: string;
+  /** `alert` (a notification) or `liveactivity` (a live card). */
+  pushType: PushType;
   /** `apns-priority`: 10 at once, 5 when convenient for the phone. */
   priority: 5 | 10;
   /** `apns-expiration`, UTC seconds. */

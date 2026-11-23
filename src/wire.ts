@@ -9,13 +9,16 @@ export const SUBPROTOCOL = 'flamekeeper-relay.v1';
 /** A board's socket, a phone's socket, or a phone's push registration call (HTTP). */
 export type Role = 'board' | 'app' | 'push';
 
-const PATH = /^\/v1\/(board|app)\/([a-z2-7]{26})(\/push)?$/;
+const PATH = /^\/v1\/(board|app)\/([a-z2-7]{26})(\/push(\/activity)?)?$/;
 
-/** The role and board id of a relay path (`/v1/board/<id>`, `/v1/app/<id>`, `/v1/app/<id>/push`), or null. */
-export function parsePath(pathname: string): { role: Role; id: string } | null {
+/**
+ * The role and board id of a relay path (`/v1/board/<id>`, `/v1/app/<id>`, `/v1/app/<id>/push`,
+ * `/v1/app/<id>/push/activity`: `activity` true), or null.
+ */
+export function parsePath(pathname: string): { role: Role; id: string; activity?: boolean } | null {
   const m = PATH.exec(pathname);
   if (!m || !isBoardId(m[2])) return null;
-  if (m[3]) return m[1] === 'app' ? { role: 'push', id: m[2] } : null;
+  if (m[3]) return m[1] === 'app' ? { role: 'push', id: m[2], activity: !!m[4] } : null;
   return { role: m[1] as Role, id: m[2] };
 }
 
@@ -140,9 +143,66 @@ export function encodeOpen(channel: number, slot: number): Uint8Array {
   return new Uint8Array([0, Op.open, channel, slot]);
 }
 
-/** WANT: the slots with a push registration and with a live card, a bit per slot. */
-export function encodeWant(pushSlots: number, liveSlots: number): Uint8Array {
-  return new Uint8Array([0, Op.want, pushSlots, liveSlots]);
+/**
+ * WANT: the slots with a device token (alerts), with a live card (its update token) and that can
+ * be sent a push-to-start (a start token), a bit per slot.
+ */
+export function encodeWant(pushSlots: number, liveSlots: number, startSlots: number): Uint8Array {
+  return new Uint8Array([0, Op.want, pushSlots, liveSlots, startSlots]);
+}
+
+export const LiveEvent = { start: 0, update: 1, end: 2 } as const;
+const NO_STARTER = 0xff;
+
+export interface Live {
+  /** 0 start, 1 update, 2 end. */
+  event: 0 | 1 | 2;
+  /** Flags bit 0: APNs priority 10. */
+  important: boolean;
+  /** Flags bit 1: the run ended on a fault or an alert (the longer dismissal). */
+  faultEnd: boolean;
+  /** Seconds until the card goes grey. */
+  staleS: number;
+  /** For an end: seconds the final card stays. */
+  dismissalS: number;
+  /** The slot of the phone that started the run; null for none. */
+  starter: number | null;
+  /** Per slot, the live record sealed for that phone. */
+  blobs: Map<number, Uint8Array>;
+}
+
+/**
+ * LIVE: `00 07` ‖ u8 event 0-2 ‖ u8 flags ‖ u16 stale s ‖ u16 dismissal s ‖ u8 starter slot
+ * (0xFF none) ‖ u8 n ≤ 8 ‖ n × (u8 slot 0-7, u8 length ≥ 28, blob); slots unique, the lengths
+ * exactly filling the message.
+ */
+export function decodeLive(m: Uint8Array): Live | null {
+  if (m.length < 10 || m[0] !== 0 || m[1] !== Op.live) return null;
+  const event = m[2];
+  const flags = m[3];
+  const starter = m[8];
+  const n = m[9];
+  if (event > 2 || (starter >= SLOTS && starter !== NO_STARTER) || n > SLOTS) return null;
+  const blobs = new Map<number, Uint8Array>();
+  let o = 10;
+  for (let i = 0; i < n; i++) {
+    if (o + 2 > m.length) return null;
+    const slot = m[o];
+    const length = m[o + 1];
+    if (slot >= SLOTS || blobs.has(slot) || length < BLOB_MIN || o + 2 + length > m.length) return null;
+    blobs.set(slot, m.slice(o + 2, o + 2 + length));
+    o += 2 + length;
+  }
+  if (o !== m.length) return null;
+  return {
+    event: event as 0 | 1 | 2,
+    important: (flags & 1) !== 0,
+    faultEnd: (flags & 2) !== 0,
+    staleS: m[4] | (m[5] << 8),
+    dismissalS: m[6] | (m[7] << 8),
+    starter: starter === NO_STARTER ? null : starter,
+    blobs,
+  };
 }
 
 export function encodeClose(channel: number, code: number): Uint8Array {

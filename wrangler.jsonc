@@ -18,9 +18,18 @@
   // them the relay answers registrations "push not available".
   "vars": { "BUNDLE_ID": "app.flamekeeper.Flamekeeper", "CRITICAL_ALERTS": "0" },
 
-  // One Durable Object per board id: the board's socket, its phones' sockets, the roster (SQLite).
-  "durable_objects": { "bindings": [{ "name": "BOARD", "class_name": "BoardRoom" }] },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["BoardRoom"] }],
+  // One Durable Object per board id: the board's socket, its phones' sockets, the roster and the
+  // push registrations (SQLite). One more, named "apns", sends every push to Apple.
+  "durable_objects": {
+    "bindings": [
+      { "name": "BOARD", "class_name": "BoardRoom" },
+      { "name": "PUSH", "class_name": "PushSender" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BoardRoom"] },
+    { "tag": "v2", "new_sqlite_classes": ["PushSender"] }
+  ],
 
   // Connects per client address a minute (Workers rate limiting). A namespace_id must be unique in
   // the Cloudflare account: change these if another Worker there uses them.
@@ -35,7 +44,12 @@
       "routes": [{ "pattern": "relay-test.flamekeeper.app", "custom_domain": true }],
       // vars are not inherited by an environment: the same as above.
       "vars": { "BUNDLE_ID": "app.flamekeeper.Flamekeeper", "CRITICAL_ALERTS": "0" },
-      "durable_objects": { "bindings": [{ "name": "BOARD", "class_name": "BoardRoom" }] },
+      "durable_objects": {
+        "bindings": [
+          { "name": "BOARD", "class_name": "BoardRoom" },
+          { "name": "PUSH", "class_name": "PushSender" }
+        ]
+      },
       "ratelimits": [
         { "name": "BOARD_CONNECTS", "namespace_id": "4011", "simple": { "limit": 20, "period": 60 } },
         { "name": "APP_CONNECTS", "namespace_id": "4012", "simple": { "limit": 60, "period": 60 } }

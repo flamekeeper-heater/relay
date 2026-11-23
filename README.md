@@ -19,7 +19,10 @@ Wi-Fi key, so nothing new is exchanged when pairing.
 
 For push notifications the board decides what to send, filters it per phone and encrypts one blob
 per phone. The relay adds the phone's device token and hands the request to Apple's push service
-(APNs). It also tells phones, if they asked, when their heater has been offline for a while.
+(APNs). It also tells phones, if they asked, when their heater has been offline for a while. Live
+cards (iOS Live Activities) work the same way: the board seals the card's content per phone, and the
+relay sends it to that phone's card, starts a card on phones that want one, renews cards at 8 hours
+and greys them out when it loses the board.
 
 What the relay keeps: per board, the list of phone token hashes, when it was last seen, and the
 phones' push registrations; all of it is deleted after 90 days without the board. Its logs carry
@@ -67,9 +70,6 @@ npx wrangler secret put APNS_KEY_P8     # the .p8 key file's contents
 npx wrangler secret put APNS_KEY_ID     # its 10-character key id
 npx wrangler secret put APNS_TEAM_ID    # your team id
 ```
-
-> **Status:** the APNs sender is not written yet, so even with the secrets set every push is logged
-> `push not available`.
 
 **Trying a board against a local relay:** a board connects only over TLS, so expose
 `npm run dev` through a Cloudflare quick tunnel (`cloudflared tunnel --url http://localhost:8787`),

@@ -32,7 +32,7 @@ function randomToken(): Uint8Array {
 }
 
 /** A signed-in board whose roster the relay has stored. */
-async function boardWith(entries: Array<[number, Uint8Array]>, b?: FakeBoardSocket, want = '00080000'): Promise<FakeBoardSocket> {
+async function boardWith(entries: Array<[number, Uint8Array]>, b?: FakeBoardSocket, want = '0008000000'): Promise<FakeBoardSocket> {
   b ??= await fakeBoard();
   await b.signIn();
   b.roster(entries);
@@ -56,7 +56,10 @@ function call(url: string, init: RequestInit & { headers?: Record<string, string
 describe('registration parsing', () => {
   it('reads the registration path as role push', () => {
     const id = 'ngf6uy64isruizr76fbjv2qqqq';
-    expect(parsePath(`/v1/app/${id}/push`)).toEqual({ role: 'push', id });
+    expect(parsePath(`/v1/app/${id}/push`)).toEqual({ role: 'push', id, activity: false });
+    expect(parsePath(`/v1/app/${id}/push/activity`)).toEqual({ role: 'push', id, activity: true });
+    expect(parsePath(`/v1/board/${id}/push/activity`)).toBeNull();
+    expect(parsePath(`/v1/app/${id}/push/activity/`)).toBeNull();
     expect(parsePath(`/v1/board/${id}/push`)).toBeNull();
     expect(parsePath(`/v1/app/${id}/push/`)).toBeNull();
     expect(parsePath(`/v1/app/${id}/pushx`)).toBeNull();
@@ -118,21 +121,37 @@ describe('push registrations', () => {
     const b = await boardWith([[2, H]]);
     expect((await register(b.id, T, FIRST)).status).toBe(204);
     expect(await rows(b.id, 'push')).toEqual([
-      { slot: 2, kind: 'apns', env: 'sandbox', device: DEVICE, offline_after: 0, offline_sent: 0, updated: expect.any(Number) },
+      {
+        slot: 2,
+        kind: 'apns',
+        env: 'sandbox',
+        device: DEVICE,
+        offline_after: 0,
+        offline_sent: 0,
+        updated: expect.any(Number),
+        start_token: null,
+        activity_token: null,
+        activity_started: null,
+        ios: null,
+        dismissed_run: null,
+        started_run: null,
+        live_blob: null,
+        live_event: null,
+      },
     ]);
   });
 
   it('tells a signed-in board at once', async () => {
     const b = await boardWith([[2, H]]);
     expect((await register(b.id, T, FIRST)).status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080400');
+    expect(toHex(await b.next())).toBe('0008040000');
     expect(await b.quiet()).toBe(true);
   });
 
   it('merges fields', async () => {
     const b = await boardWith([[2, H]]);
     expect((await register(b.id, T, { env: 'sandbox', device: DEVICE })).status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080400');
+    expect(toHex(await b.next())).toBe('0008040000');
     expect((await register(b.id, T, { offlineAfter: 60 })).status).toBe(204);
     expect(await rows(b.id, 'push')).toMatchObject([{ slot: 2, kind: 'apns', env: 'sandbox', device: DEVICE, offline_after: 60 }]);
     expect((await register(b.id, T, { env: 'production', device: 'bb'.repeat(32) })).status).toBe(204);
@@ -192,9 +211,9 @@ describe('push registrations', () => {
   it('DELETE removes it and the next WANT is 00 08 00 00', async () => {
     const b = await boardWith([[2, H]]);
     expect((await register(b.id, T, FIRST)).status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080400');
+    expect(toHex(await b.next())).toBe('0008040000');
     expect((await register(b.id, T, null, 'DELETE')).status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080000');
+    expect(toHex(await b.next())).toBe('0008000000');
     expect(await rows(b.id, 'push')).toEqual([]);
     expect((await register(b.id, T, null, 'DELETE')).status).toBe(204); // already gone: still fine
     expect(await b.quiet()).toBe(true);
@@ -203,9 +222,9 @@ describe('push registrations', () => {
   it('a device of null keeps the row but leaves the push mask', async () => {
     const b = await boardWith([[2, H]]);
     expect((await register(b.id, T, { ...FIRST, offlineAfter: 30 })).status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080400');
+    expect(toHex(await b.next())).toBe('0008040000');
     expect((await register(b.id, T, { device: null })).status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080000');
+    expect(toHex(await b.next())).toBe('0008000000');
     expect(await rows(b.id, 'push')).toMatchObject([{ slot: 2, device: null, offline_after: 30 }]);
   });
 
@@ -217,41 +236,41 @@ describe('push registrations', () => {
     ]);
     expect((await register(b.id, T, FIRST)).status).toBe(204);
     expect((await register(b.id, other, FIRST)).status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080400');
-    expect(toHex(await b.next())).toBe('00080600');
+    expect(toHex(await b.next())).toBe('0008040000');
+    expect(toHex(await b.next())).toBe('0008060000');
     b.roster([[1, await sha256(other)]]);
-    expect(toHex(await b.next())).toBe('00080200');
+    expect(toHex(await b.next())).toBe('0008020000');
     expect((await rows(b.id, 'push')).map((r) => r.slot)).toEqual([1]);
   });
 
   it('a new hash in the slot deletes it (a new phone in an old phone’s slot)', async () => {
     const b = await boardWith([[2, H]]);
     expect((await register(b.id, T, FIRST)).status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080400');
+    expect(toHex(await b.next())).toBe('0008040000');
     const newPhone = randomToken();
     b.roster([[2, await sha256(newPhone)]]);
-    expect(toHex(await b.next())).toBe('00080000');
+    expect(toHex(await b.next())).toBe('0008000000');
     expect(await rows(b.id, 'push')).toEqual([]);
     expect((await register(b.id, T, FIRST)).status).toBe(401); // the old phone is out
     b.roster([[2, await sha256(newPhone)]]); // the same roster again keeps nothing to delete
-    expect(toHex(await b.next())).toBe('00080000');
+    expect(toHex(await b.next())).toBe('0008000000');
   });
 
   it('WANT after AUTH lists the registered slots of the stored roster', async () => {
     const b = await boardWith([[2, H]]);
     expect((await register(b.id, T, FIRST)).status).toBe(204);
-    expect(toHex(await b.next())).toBe('00080400');
+    expect(toHex(await b.next())).toBe('0008040000');
     b.ws.close(1000);
     await b.closed;
     const again = await fakeBoard({ keyOf: b.keys });
-    await again.signIn('00080400');
+    await again.signIn('0008040000');
     again.roster([[2, H]]);
-    expect(toHex(await again.next())).toBe('00080400');
+    expect(toHex(await again.next())).toBe('0008040000');
   });
 
   it('answers 503 push not available when the APNs secrets are missing', async () => {
     const b = await boardWith([[2, H]]);
-    const without: Env = { BOARD: env.BOARD, BOARD_CONNECTS: env.BOARD_CONNECTS, APP_CONNECTS: env.APP_CONNECTS, BUNDLE_ID: env.BUNDLE_ID };
+    const without: Env = { BOARD: env.BOARD, PUSH: env.PUSH, BOARD_CONNECTS: env.BOARD_CONNECTS, APP_CONNECTS: env.APP_CONNECTS, BUNDLE_ID: env.BUNDLE_ID };
     const r = await handle(
       new Request(`https://${HOST}/v1/app/${b.id}/push`, {
         method: 'PUT',

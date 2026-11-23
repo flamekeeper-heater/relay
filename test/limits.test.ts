@@ -20,6 +20,7 @@ function testEnv(): Env & { boards: CountingLimiter; apps: CountingLimiter } {
   const apps = new CountingLimiter(60);
   return {
     BOARD: env.BOARD,
+    PUSH: env.PUSH,
     BOARD_CONNECTS: boards as unknown as RateLimit,
     APP_CONNECTS: apps as unknown as RateLimit,
     BUNDLE_ID: env.BUNDLE_ID,

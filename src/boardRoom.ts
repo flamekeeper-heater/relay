@@ -7,9 +7,19 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import { verifyBoardAuth } from './auth';
-import type { Env } from './index';
+import { type Env, pushAvailable } from './index';
 import { apnsForBlob, apnsForPresence } from './push/apnsMessage';
-import { type ApnsEnv, REGISTRATION_MAX, parseBearer, parseRegistration } from './push/registry';
+import {
+  LIVE_INTERVAL_MS,
+  LOST_END_S,
+  LOST_UPDATE_S,
+  type LiveRow,
+  type LiveSend,
+  lateEndRequest,
+  liveRequests,
+  lostContactRequests,
+} from './push/live';
+import { type ApnsEnv, REGISTRATION_MAX, parseActivityEnd, parseBearer, parseRegistration } from './push/registry';
 import type { ApnsItem, ApnsOutcome, ApnsPayload, PushSend } from './push/types';
 import {
   CHALLENGE_BYTES,
@@ -20,6 +30,7 @@ import {
   TOKEN_BYTES,
   decodeAuth,
   decodeClose,
+  decodeLive,
   decodePush,
   decodeRoster,
   encodeChallenge,
@@ -60,8 +71,27 @@ type PushRow = {
   offline_after: number;
 };
 
-/** One APNs item and the slot it is for (to forget the token if APNs calls it gone). */
-type PushSendItem = { slot: number; item: ApnsItem };
+/**
+ * One APNs item, the slot it is for and which of the slot's tokens it uses (to forget that token if
+ * APNs calls it gone), and for a live card what to record once it is sent.
+ */
+type PushSendItem = { slot: number; item: ApnsItem; token?: 'device' | 'start' | 'activity'; after?: LiveSend['after']; run?: number };
+
+/** The slots with a device token, with a live card and with a push-to-start token, a bit each. */
+type Masks = { push: number; live: number; start: number };
+
+/** The push table's live card columns, added to rooms stored before live cards. */
+const LIVE_COLUMNS: Array<[name: string, type: string]> = [
+  ['start_token', 'TEXT'],
+  ['activity_token', 'TEXT'],
+  ['activity_started', 'INTEGER'],
+  ['ios', 'TEXT'],
+  ['dismissed_run', 'INTEGER'],
+  ['started_run', 'INTEGER'],
+  ['live_blob', 'BLOB'],
+  ['live_event', 'INTEGER'],
+];
+const LIVE_SELECT = `slot, env, start_token, activity_token, activity_started, ios, dismissed_run, started_run, live_blob, live_event`;
 
 const SIGN_IN_MS = 10_000;
 const FORGET_MS = 90 * 24 * 3600 * 1000;
@@ -114,17 +144,20 @@ export class BoardRoom extends DurableObject<Env> {
   /** Milliseconds since the epoch; tests replace it. */
   clock: () => number = () => Date.now();
   mem: Memory = freshMemory();
-  /** Hands APNs items to Apple. None yet: the APNs sender is not built, so every item fails. */
+  /** Hands APNs items to Apple, through the one APNs sender object; tests replace it. */
   pushSender: PushSend = async (items) => {
-    log(this.ctx.id.name, 'push not available');
-    return items.map((): ApnsOutcome => 'failed');
+    if (!pushAvailable(this.env)) {
+      log(this.ctx.id.name, 'push not available');
+      return items.map((): ApnsOutcome => 'failed');
+    }
+    return this.env.PUSH.getByName('apns').send(items);
   };
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const path = parsePath(url.pathname);
     if (!path) return new Response('Not found', { status: 404 });
-    if (path.role === 'push') return this.registration(request);
+    if (path.role === 'push') return this.registration(request, path.activity === true);
     const pair = new WebSocketPair();
     const ws = pair[1];
     this.ctx.acceptWebSocket(ws, [path.role]);
@@ -185,6 +218,8 @@ export class BoardRoom extends DurableObject<Env> {
         log(this.ctx.id.name, 'forgotten');
       } else {
         await this.offlinePushes(now, seen);
+        // The board may have signed in while the offline pushes went out.
+        if (!this.board()) await this.lostContact(now, seen);
       }
     }
     await this.scheduleAlarm();
@@ -223,8 +258,11 @@ export class BoardRoom extends DurableObject<Env> {
       case Op.push:
         await this.boardPush(m);
         break;
+      case Op.live:
+        await this.boardLive(m);
+        break;
       default:
-      // LIVE is reserved and ignored; so is anything else.
+      // Anything else is ignored.
     }
   }
 
@@ -246,6 +284,7 @@ export class BoardRoom extends DurableObject<Env> {
     }
     attach(ws, { ...a, authed: true });
     this.setLastSeen();
+    this.setMeta('lost_stage', null);
     this.sendWant(ws, this.roster().keys());
     await this.scheduleAlarm();
     log(a.id, 'board in');
@@ -261,24 +300,38 @@ export class BoardRoom extends DurableObject<Env> {
   }
 
   /**
-   * WANT: which of these slots have a push registration and a live card. Sent after AUTH, after
-   * every ROSTER and when registrations change; the board replaces its masks with each one, so a
-   * board that reconnects learns of phones registered earlier.
+   * WANT: which of these slots have a device token, a live card and a push-to-start token. Sent
+   * after AUTH, after every ROSTER and when registrations change; the board replaces its masks with
+   * each one, so a board that reconnects learns of phones registered earlier.
    */
   private sendWant(board: WebSocket, slots: Iterable<number>): void {
     let inRoster = 0;
     for (const s of slots) inRoster |= 1 << s;
     const r = this.registrations();
-    send(board, encodeWant(r.push & inRoster, r.live & inRoster));
+    send(board, encodeWant(r.push & inRoster, r.live & inRoster, r.start & inRoster));
   }
 
-  /** Slots with a push registration (one with a device token) and with a live card, a bit each. */
-  private registrations(): { push: number; live: number } {
-    let push = 0;
+  /** Slots with a device token, with a live card and with a push-to-start token, a bit each. */
+  private registrations(): Masks {
+    const m: Masks = { push: 0, live: 0, start: 0 };
     if (this.hasPushTable()) {
-      for (const r of this.ctx.storage.sql.exec<{ slot: number }>(`SELECT slot FROM push WHERE device IS NOT NULL`)) push |= 1 << r.slot;
+      for (const r of this.ctx.storage.sql.exec<{ slot: number; d: number; a: number; s: number }>(
+        `SELECT slot, device IS NOT NULL AS d, activity_token IS NOT NULL AS a, start_token IS NOT NULL AS s FROM push`,
+      )) {
+        if (r.d) m.push |= 1 << r.slot;
+        if (r.a) m.live |= 1 << r.slot;
+        if (r.s) m.start |= 1 << r.slot;
+      }
     }
-    return { push, live: 0 };
+    return m;
+  }
+
+  /** WANT to the signed-in board if the masks differ from `before`. */
+  private wantIfChanged(before: Masks): void {
+    const now = this.registrations();
+    if (now.push === before.push && now.live === before.live && now.start === before.start) return;
+    const board = this.board();
+    if (board) this.sendWant(board, this.roster().keys());
   }
 
   /**
@@ -309,63 +362,98 @@ export class BoardRoom extends DurableObject<Env> {
 
   /**
    * A phone's `PUT` (merge these fields into its slot's row) or `DELETE` of its push registration,
-   * authenticated by its relay token: the slot is the one whose roster hash the token matches, so
-   * only a phone the board paired can register, and only for itself. Nothing is written for a
-   * token the roster does not hold (nor for a room no board signed in to).
+   * or its `DELETE …/push/activity` (its card ended or was swiped away), authenticated by its relay
+   * token: the slot is the one whose roster hash the token matches, so only a phone the board
+   * paired can register, and only for itself. Nothing is written for a token the roster does not
+   * hold (nor for a room no board signed in to).
    */
-  private async registration(request: Request): Promise<Response> {
+  private async registration(request: Request, activity: boolean): Promise<Response> {
     const id = this.ctx.id.name;
     const method = request.method;
-    if (method !== 'PUT' && method !== 'DELETE') return reply(405, 'Method not allowed', { Allow: 'PUT, DELETE' });
+    if (activity ? method !== 'DELETE' : method !== 'PUT' && method !== 'DELETE') {
+      return reply(405, 'Method not allowed', { Allow: activity ? 'DELETE' : 'PUT, DELETE' });
+    }
     const token = parseBearer(request.headers.get('Authorization'));
     const body = await readCapped(request, REGISTRATION_MAX);
     if (!body) return reply(413, 'Too large');
     if (!token) return reply(401, 'Unauthorized');
     const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', token));
 
-    // From here on nothing awaits, so the roster cannot change between the check and the write.
+    // From here on nothing awaits until the writes are done, so the roster cannot change between
+    // the check and the write.
     const slot = this.slotOf(hash);
     if (slot === null) {
       this.badToken();
       log(id, 'push registration refused', 401);
       return reply(401, 'Unauthorized');
     }
-    let patch = null;
-    if (method === 'PUT') {
-      patch = parseRegistration(decodeUtf8(body) ?? '');
-      if (!patch) return reply(400, 'Bad registration');
-    }
+    const text = decodeUtf8(body) ?? '';
     this.ensureSchema();
-    const mask = this.registrations().push;
+    const before = this.registrations();
     const sql = this.ctx.storage.sql;
-    if (!patch) {
+    let lateEnd: PushSendItem | null = null;
+    if (activity) {
+      const end = parseActivityEnd(text);
+      if (!end) return reply(400, 'Bad registration');
+      // Only the card that ended (when the phone names it): a newer one may be registered already.
+      const current = sql.exec<{ t: string | null }>(`SELECT activity_token AS t FROM push WHERE slot = ?`, slot).toArray()[0]?.t ?? null;
+      if (current !== null && (end.token === null || end.token === current)) {
+        // A card swiped away gets no push-to-start again in this run.
+        sql.exec(
+          `UPDATE push SET activity_token = NULL, activity_started = NULL, dismissed_run = CASE WHEN ? THEN ? ELSE dismissed_run END WHERE slot = ?`,
+          end.reason === 'dismissed' ? 1 : 0,
+          end.reason === 'dismissed' ? this.meta('live_run') : null,
+          slot,
+        );
+      }
+      log(id, `push slot ${slot} card ${end.reason}`);
+    } else if (method === 'DELETE') {
       sql.exec(`DELETE FROM push WHERE slot = ?`, slot);
+      log(id, `push slot ${slot} removed`);
     } else {
+      const patch = parseRegistration(text);
+      if (!patch) return reply(400, 'Bad registration');
       const row = sql
-        .exec<{ kind: string; env: string; device: string | null; offline_after: number }>(
-          `SELECT kind, env, device, offline_after FROM push WHERE slot = ?`,
+        .exec<{ kind: string; env: string; device: string | null; offline_after: number; start_token: string | null; activity_token: string | null; activity_started: number | null; ios: string | null; dismissed_run: number | null }>(
+          `SELECT kind, env, device, offline_after, start_token, activity_token, activity_started, ios, dismissed_run FROM push WHERE slot = ?`,
           slot,
         )
         .toArray()[0];
-      if (!row && (patch.env === undefined || typeof patch.device !== 'string')) return reply(400, 'Bad registration');
+      const anyToken = [patch.device, patch.startToken, patch.activityToken].some((t) => typeof t === 'string');
+      if (!row && (patch.env === undefined || !anyToken)) return reply(400, 'Bad registration');
+      const pick = <T>(v: T | undefined, old: T): T => (v !== undefined ? v : old);
+      const activityToken = pick(patch.activityToken, row?.activity_token ?? null);
       sql.exec(
-        `INSERT INTO push (slot, kind, env, device, offline_after, updated) VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO push (slot, kind, env, device, offline_after, updated, start_token, activity_token, activity_started, ios, dismissed_run)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (slot) DO UPDATE SET kind = excluded.kind, env = excluded.env, device = excluded.device,
-           offline_after = excluded.offline_after, updated = excluded.updated`,
+           offline_after = excluded.offline_after, updated = excluded.updated, start_token = excluded.start_token,
+           activity_token = excluded.activity_token, activity_started = excluded.activity_started, ios = excluded.ios,
+           dismissed_run = excluded.dismissed_run`,
         slot,
         patch.kind ?? row?.kind ?? 'apns',
         patch.env ?? row!.env,
-        patch.device !== undefined ? patch.device : row!.device,
+        pick(patch.device, row?.device ?? null),
         patch.offlineAfter ?? row?.offline_after ?? 0,
         Math.floor(this.clock() / 1000),
+        pick(patch.startToken, row?.start_token ?? null),
+        activityToken,
+        // A card's start belongs to its token: a new token without one has none.
+        activityToken === null
+          ? null
+          : pick(patch.activityStartedAt, activityToken === row?.activity_token ? (row?.activity_started ?? null) : null),
+        patch.iosVersion ?? row?.ios ?? null,
+        // A new card is the phone wanting one again.
+        typeof patch.activityToken === 'string' ? null : (row?.dismissed_run ?? null),
       );
+      log(id, `push slot ${slot} set`);
+      if (typeof patch.activityToken === 'string') lateEnd = this.lateEnd(slot);
     }
-    log(id, patch ? `push slot ${slot} set` : `push slot ${slot} removed`);
-    const board = this.board();
-    if (board && this.registrations().push !== mask) this.sendWant(board, this.roster().keys());
+    this.wantIfChanged(before);
+    if (lateEnd) await this.deliver('late end', [lateEnd]);
     // While the board is away, a new or shorter offline delay, or a device token back, moves the
     // offline deadline (a deadline already past fires at once, with t = last seen).
-    if (!board) await this.scheduleAlarm();
+    if (!this.board()) await this.scheduleAlarm();
     return new Response(null, { status: 204 });
   }
 
@@ -399,6 +487,104 @@ export class BoardRoom extends DurableObject<Env> {
       if (phone) sends.push(this.itemFor(phone, apnsForBlob(p.cls, id, blob, critical)));
     }
     await this.deliver('push', sends);
+  }
+
+  /**
+   * A LIVE from the signed-in board: per phone it sealed a record for, an update to its card, a
+   * push-to-start, or the card's end (`liveRequests`). At most one per 20 s; an end always passes.
+   * Each phone's last blob is kept for the lost-contact update and the 8-hour renewal.
+   */
+  private async boardLive(m: Uint8Array): Promise<void> {
+    const id = this.boardId();
+    if (!id) {
+      log(undefined, 'live skipped: no board id');
+      return;
+    }
+    const l = decodeLive(m);
+    if (!l) {
+      log(id, 'live malformed');
+      return;
+    }
+    const now = this.clock();
+    const nowS = Math.floor(now / 1000);
+    const last = this.meta('live_at');
+    // Only updates are limited: a start or an end always passes.
+    if (l.event === 1 && last !== null && now >= last && now - last < LIVE_INTERVAL_MS) {
+      log(id, 'live over the limit');
+      return;
+    }
+    this.setMeta('live_at', now);
+    if (l.event === 0) {
+      this.setMeta('live_run', now);
+      this.setMeta('live_ended', null);
+    }
+    const run = this.run();
+    if (l.event === 2) {
+      // The run is over: the next LIVE starts a new one. A card push-started in this run whose token
+      // comes only later is ended then (`lateEnd`).
+      this.setMeta('live_run', null);
+      this.setMeta('live_ended', nowS);
+      this.setMeta('live_end_until', nowS + l.dismissalS);
+    }
+    if (this.hasPushTable()) {
+      for (const [slot, blob] of l.blobs) this.ctx.storage.sql.exec(`UPDATE push SET live_blob = ?, live_event = ? WHERE slot = ?`, blob, l.event, slot);
+    }
+    const sends = liveRequests(l, this.liveRows(), { relayId: id, nowS, run });
+    await this.deliver(
+      'live',
+      sends.map((x) => ({ ...x, run })),
+    );
+  }
+
+  /**
+   * A card token registered after its run ended (a push-to-start the phone acted on late, or a run
+   * that ended within seconds): the end goes to it at once, with the run's last record.
+   */
+  private lateEnd(slot: number): PushSendItem | null {
+    const ended = this.meta('live_ended');
+    if (ended === null || this.meta('live_run') !== null) return null;
+    const r = this.liveRows().find((x) => x.slot === slot);
+    if (!r || r.activity_started === null || r.activity_started >= ended) return null;
+    const until = this.meta('live_end_until') ?? ended;
+    return lateEndRequest(r, Math.floor(this.clock() / 1000), until);
+  }
+
+  /**
+   * The board is still away and phones have its live cards: at 10 minutes an update saying since
+   * when (`relay.lostAt` = last seen), at 60 minutes the cards' end. Once each per absence.
+   */
+  private async lostContact(now: number, seen: number): Promise<void> {
+    if (this.board()) return;
+    const stage = this.meta('lost_stage') ?? 0;
+    if (stage >= 2) return;
+    const rows = this.liveRows().filter((r) => r.activity_token !== null);
+    if (rows.length === 0) return;
+    const nowS = Math.floor(now / 1000);
+    if (now >= (seen + LOST_END_S) * 1000) {
+      this.setMeta('lost_stage', 2);
+      // A board back later in the same run may start these phones' cards again.
+      this.ctx.storage.sql.exec(`UPDATE push SET started_run = NULL`);
+      await this.deliver('lost contact end', lostContactRequests(rows, seen, nowS, true));
+    } else if (stage < 1 && now >= (seen + LOST_UPDATE_S) * 1000) {
+      this.setMeta('lost_stage', 1);
+      await this.deliver('lost contact', lostContactRequests(rows, seen, nowS, false));
+    }
+  }
+
+  /** The live card fields of the registrations in the roster. */
+  private liveRows(): LiveRow[] {
+    if (!this.hasPushTable()) return [];
+    return this.ctx.storage.sql.exec<LiveRow>(`SELECT ${LIVE_SELECT} FROM push WHERE slot IN (SELECT slot FROM roster)`).toArray();
+  }
+
+  /** The current run's id: when the board's last start came (ms); a first LIVE without one starts one. */
+  private run(): number {
+    let run = this.meta('live_run');
+    if (run === null) {
+      run = this.clock();
+      this.setMeta('live_run', run);
+    }
+    return run;
   }
 
   /**
@@ -465,9 +651,11 @@ export class BoardRoom extends DurableObject<Env> {
   private itemFor(row: PushRow, message: { priority: 5 | 10; payload: ApnsPayload }): PushSendItem {
     return {
       slot: row.slot,
+      token: 'device',
       item: {
         env: row.env,
         device: row.device,
+        pushType: 'alert',
         priority: message.priority,
         expiration: Math.floor(this.clock() / 1000) + PUSH_EXPIRY_S,
         payload: message.payload,
@@ -512,8 +700,9 @@ export class BoardRoom extends DurableObject<Env> {
   }
 
   /**
-   * Hands the items to the APNs sender, forgets the device tokens APNs calls gone (then WANT, if
-   * the push mask changed), and logs the counts: never a blob, a token or the class.
+   * Hands the items to the APNs sender, forgets the tokens APNs calls gone (a row with no token
+   * left goes), records what live card items did, then WANT if the masks changed. Logs the counts:
+   * never a blob, a token or the class.
    */
   private async deliver(what: string, sends: PushSendItem[]): Promise<ApnsOutcome[]> {
     const id = this.ctx.id.name;
@@ -527,19 +716,28 @@ export class BoardRoom extends DurableObject<Env> {
     } catch {
       outcomes = sends.map(() => 'failed');
     }
-    const mask = this.registrations().push;
+    const before = this.registrations();
+    const sql = this.ctx.storage.sql;
     const n = { sent: 0, gone: 0, failed: 0 };
-    sends.forEach(({ slot, item }, i) => {
+    sends.forEach(({ slot, item, token = 'device', after, run }, i) => {
       const o = outcomes[i] ?? 'failed';
       n[o]++;
-      // Only the token APNs refused: the phone may have registered a new one meanwhile.
-      if (o === 'gone') this.ctx.storage.sql.exec(`DELETE FROM push WHERE slot = ? AND device = ?`, slot, item.device);
+      // Only the token APNs refused or the card that ended (if APNs took the end): the phone may
+      // have registered a new one meanwhile.
+      if (o === 'gone' || (after === 'forgetCard' && o === 'sent')) {
+        if (token === 'activity') {
+          sql.exec(`UPDATE push SET activity_token = NULL, activity_started = NULL WHERE slot = ? AND activity_token = ?`, slot, item.device);
+        } else if (token === 'start') {
+          if (o === 'gone') sql.exec(`UPDATE push SET start_token = NULL WHERE slot = ? AND start_token = ?`, slot, item.device);
+        } else {
+          sql.exec(`UPDATE push SET device = NULL WHERE slot = ? AND device = ?`, slot, item.device);
+        }
+        sql.exec(`DELETE FROM push WHERE slot = ? AND device IS NULL AND start_token IS NULL AND activity_token IS NULL`, slot);
+      }
+      if (after === 'started' && o === 'sent' && run !== undefined) sql.exec(`UPDATE push SET started_run = ? WHERE slot = ?`, run, slot);
     });
     log(id, `${what}: ${n.sent} sent, ${n.gone} gone, ${n.failed} failed`);
-    if (this.registrations().push !== mask) {
-      const board = this.board();
-      if (board) this.sendWant(board, this.roster().keys());
-    }
+    this.wantIfChanged(before);
     return outcomes;
   }
 
@@ -696,9 +894,16 @@ export class BoardRoom extends DurableObject<Env> {
     return this.ctx.storage.sql.exec(`SELECT 1 FROM sqlite_master LIMIT 1`).toArray().length > 0;
   }
 
+  /** Whether the push table exists; one stored before live cards gets their columns here. */
   private hasPushTable(): boolean {
-    this.mem.push ??=
-      this.ctx.storage.sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'push'`).toArray().length > 0;
+    if (this.mem.push === null) {
+      const exists = this.ctx.storage.sql.exec(`SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'push'`).toArray().length > 0;
+      if (exists) {
+        const have = new Set(this.ctx.storage.sql.exec<{ name: string }>(`SELECT name FROM pragma_table_info('push')`).toArray().map((r) => r.name));
+        for (const [name, type] of LIVE_COLUMNS) if (!have.has(name)) this.ctx.storage.sql.exec(`ALTER TABLE push ADD COLUMN ${name} ${type}`);
+      }
+      this.mem.push = exists;
+    }
     return this.mem.push;
   }
 
@@ -714,14 +919,28 @@ export class BoardRoom extends DurableObject<Env> {
     }
     if (!this.hasPushTable()) {
       // Per roster slot: the phone's APNs device token and environment, its "heater offline"
-      // delay (minutes, 0 off), whether that push went out for the current absence, and when
-      // the phone last changed the row (UTC seconds).
+      // delay (minutes, 0 off), whether that push went out for the current absence, when the
+      // phone last changed the row (UTC seconds), and its live card fields (`LiveRow`).
       this.ctx.storage.sql.exec(
         `CREATE TABLE IF NOT EXISTS push (slot INTEGER PRIMARY KEY, kind TEXT NOT NULL, env TEXT NOT NULL, device TEXT,
-           offline_after INTEGER NOT NULL DEFAULT 0, offline_sent INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL)`,
+           offline_after INTEGER NOT NULL DEFAULT 0, offline_sent INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL,
+           ${LIVE_COLUMNS.map(([n, t]) => `${n} ${t}`).join(', ')})`,
       );
       this.mem.push = true;
     }
+  }
+
+  private meta(key: string): number | null {
+    if (!this.hasSchema()) return null;
+    const row = this.ctx.storage.sql.exec<{ value: number }>(`SELECT value FROM meta WHERE key = ?`, key).toArray()[0];
+    return row ? row.value : null;
+  }
+
+  /** Sets (or with null deletes) a meta value; only in a room whose tables exist. */
+  private setMeta(key: string, value: number | null): void {
+    if (!this.hasSchema()) return;
+    if (value === null) this.ctx.storage.sql.exec(`DELETE FROM meta WHERE key = ?`, key);
+    else this.ctx.storage.sql.exec(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value);
   }
 
   private setLastSeen(): void {
@@ -751,7 +970,7 @@ export class BoardRoom extends DurableObject<Env> {
 
   /**
    * Sets the alarm to the earliest pending deadline: a sign-in or token timeout, and while no board
-   * is signed in, a phone's offline delay or forgetting the board.
+   * is signed in, a phone's offline delay, the live cards' lost contact or forgetting the board.
    */
   private async scheduleAlarm(): Promise<void> {
     let next = Infinity;
@@ -764,6 +983,10 @@ export class BoardRoom extends DurableObject<Env> {
     if (seen !== null && !this.board()) {
       next = Math.min(next, seen * 1000 + FORGET_MS);
       for (const r of this.offlineRows()) next = Math.min(next, seen * 1000 + r.offline_after * MINUTE_MS);
+      const stage = this.meta('lost_stage') ?? 0;
+      if (stage < 2 && this.liveRows().some((r) => r.activity_token !== null)) {
+        next = Math.min(next, (seen + (stage < 1 ? LOST_UPDATE_S : LOST_END_S)) * 1000);
+      }
     }
     const have = await this.ctx.storage.getAlarm();
     if (next === Infinity) {

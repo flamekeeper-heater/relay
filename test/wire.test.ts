@@ -59,8 +59,8 @@ describe('control messages', () => {
     const c = new Uint8Array(32).fill(0xab);
     expect(toHex(encodeChallenge(c))).toBe('0001' + 'ab'.repeat(32));
     expect(toHex(encodeOpen(1, 2))).toBe('00040102');
-    expect(toHex(encodeWant(0, 0))).toBe('00080000');
-    expect(toHex(encodeWant(0x81, 0x04))).toBe('00088104');
+    expect(toHex(encodeWant(0, 0, 0))).toBe('0008000000');
+    expect(toHex(encodeWant(0x81, 0x04, 0x20))).toBe('0008810420');
     expect(toHex(encodeClose(1, 4001))).toBe('000501a10f');
     expect(decodeClose(encodeClose(2, 4001))).toEqual({ channel: 2, code: 4001 });
     expect(decodeClose(new Uint8Array([0, 5, 1, 0]))).toBeNull();
