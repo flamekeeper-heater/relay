@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ProviderToken, TOKEN_MIN_S, TOKEN_REUSE_S, apnsJwt, apnsRequest, importApnsKey } from '../src/push/apns';
+import { FALLBACK_HOLD_S, ProviderToken, TOKEN_MIN_S, TOKEN_REUSE_S, TOKEN_VALID_S, apnsJwt, apnsRequest, importApnsKey } from '../src/push/apns';
 
 const NOW = 1_900_000_000;
 
@@ -58,6 +58,33 @@ describe('provider token', () => {
     expect(await t.get(NOW + TOKEN_MIN_S - 1)).toBe(a);
     t.expire(NOW + TOKEN_MIN_S);
     expect(await t.get(NOW + TOKEN_MIN_S)).not.toBe(a);
+  });
+
+  it('a new token APNs calls too soon goes back to the one before for 5 minutes, while it is valid', async () => {
+    const t = new ProviderToken(importApnsKey((await testKey()).pem), 'K', 'T');
+    const a = await t.get(NOW);
+    const r = NOW + TOKEN_REUSE_S;
+    const b = await t.get(r);
+    expect(t.fallBack(r)).toBe(true);
+    expect(await t.get(r)).toBe(a);
+    expect(await t.get(r + FALLBACK_HOLD_S - 1)).toBe(a);
+    expect(t.fallBack(r)).toBe(false);
+    const c = await t.get(r + FALLBACK_HOLD_S);
+    expect(c).not.toBe(a);
+    expect(c).not.toBe(b);
+    expect(json(c, 1)).toEqual({ iss: 'T', iat: r + FALLBACK_HOLD_S });
+    // Refused again: back to the first one, but never past its 55 minutes.
+    expect(t.fallBack(NOW + TOKEN_VALID_S - 60)).toBe(true);
+    expect(await t.get(NOW + TOKEN_VALID_S - 1)).toBe(a);
+    expect(await t.get(NOW + TOKEN_VALID_S)).not.toBe(a);
+    expect(t.fallBack(NOW + TOKEN_VALID_S)).toBe(false);
+  });
+
+  it('has nothing to go back to when the only token is refused', async () => {
+    const t = new ProviderToken(importApnsKey((await testKey()).pem), 'K', 'T');
+    const a = await t.get(NOW);
+    expect(t.fallBack(NOW)).toBe(false);
+    expect(await t.get(NOW)).toBe(a);
   });
 });
 

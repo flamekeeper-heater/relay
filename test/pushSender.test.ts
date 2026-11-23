@@ -31,6 +31,7 @@ async function fakeApns(answer: (n: number) => [number, string?] = () => [200]) 
   await runInDurableObject(env.PUSH.getByName('apns'), (o: PushSender) => {
     (o as unknown as { env: RelayEnv }).env = { ...(env as unknown as RelayEnv), APNS_KEY_P8: pem };
     o.clock = () => clock.ms;
+    o.tokenReuseS = TOKEN_REUSE_S;
     o.sleep = async (ms) => {
       sleeps.push(ms);
     };
@@ -128,6 +129,30 @@ describe('APNs sender', () => {
     expect(seen).toHaveLength(3);
     expect(seen[2].headers.authorization).not.toBe(seen[1].headers.authorization);
     expect(sleeps).toEqual([]);
+  });
+
+  it('a renewed token APNs calls too soon: the push goes again at once with the one before', async () => {
+    const { seen, clock, sleeps } = await fakeApns((n) => (n === 1 ? [429, 'TooManyProviderTokenUpdates'] : [200]));
+    await send([ITEM]);
+    clock.ms = NOW + TOKEN_REUSE_S * 1000;
+    expect(await send([ITEM])).toEqual(['sent']);
+    expect(seen).toHaveLength(3);
+    expect(seen[1].headers.authorization).not.toBe(seen[0].headers.authorization);
+    expect(seen[2].headers.authorization).toBe(seen[0].headers.authorization);
+    expect(sleeps).toEqual([]);
+    // The one before stays in use for 5 minutes, also across a restart of the sender.
+    resetProviderToken();
+    clock.ms += 60_000;
+    await send([ITEM]);
+    expect(seen[3].headers.authorization).toBe(seen[0].headers.authorization);
+  });
+
+  it('the first token APNs calls too soon is tried once more after 2 s', async () => {
+    const { seen, sleeps } = await fakeApns((n) => (n === 0 ? [429, 'TooManyProviderTokenUpdates'] : [200]));
+    expect(await send([ITEM])).toEqual(['sent']);
+    expect(seen).toHaveLength(2);
+    expect(seen[1].headers.authorization).toBe(seen[0].headers.authorization);
+    expect(sleeps).toEqual([2000]);
   });
 
   it('tries a 503 once more after 2 s, then gives up', async () => {

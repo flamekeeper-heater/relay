@@ -4,7 +4,10 @@
 
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../index';
-import { ProviderToken, apnsRequest, importApnsKey } from './apns';
+import { ProviderToken, TOKEN_REUSE_S, apnsRequest, importApnsKey } from './apns';
+
+/** Up to this much is added to a token's 40 minutes, so relays sharing a key rarely renew together. */
+export const TOKEN_JITTER_S = 300;
 import type { ApnsItem, ApnsOutcome } from './types';
 
 /** A 429 or 5xx (or no answer at all) is tried once more after this. */
@@ -30,6 +33,7 @@ interface KeptToken {
   id: string;
   jwt: string;
   iat: number;
+  hold?: number;
 }
 
 /** Forgets the isolate's token (tests; the stored one stays). */
@@ -44,6 +48,8 @@ export class PushSender extends DurableObject<Env> {
   fetchApns: (r: Request) => Promise<Response> = (r) => fetch(r);
   /** Waits before a retry; tests replace it. */
   sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms));
+  /** How long a provider token is used; tests replace it. */
+  tokenReuseS: number = TOKEN_REUSE_S + Math.floor(Math.random() * TOKEN_JITTER_S);
 
   async send(items: ApnsItem[]): Promise<ApnsOutcome[]> {
     if (items.length === 0) return [];
@@ -73,20 +79,21 @@ export class PushSender extends DurableObject<Env> {
   private async providerToken(): Promise<ProviderToken> {
     const id = await this.keyId();
     if (shared?.id === id) return shared.token;
-    const token = new ProviderToken(importApnsKey(this.env.APNS_KEY_P8 ?? ''), this.env.APNS_KEY_ID ?? '', this.env.APNS_TEAM_ID ?? '');
+    const token = new ProviderToken(importApnsKey(this.env.APNS_KEY_P8 ?? ''), this.env.APNS_KEY_ID ?? '', this.env.APNS_TEAM_ID ?? '', this.tokenReuseS);
     const kept = await this.ctx.storage.get<KeptToken>('token');
-    if (kept?.id === id) token.seed(kept.jwt, kept.iat);
+    if (kept?.id === id) token.seed(kept.jwt, kept.iat, kept.hold ?? 0);
     shared = { id, token };
     return token;
   }
 
-  /** Stores the token when it is a new one. */
+  /** Stores the token when it is a new one (or held after a fallback). */
   private async keep(token: ProviderToken): Promise<void> {
     const iat = token.issuedAt;
+    const hold = token.heldUntil;
     if (iat === 0 || !shared) return;
     const kept = await this.ctx.storage.get<KeptToken>('token');
-    if (kept?.iat === iat && kept.id === shared.id) return;
-    await this.ctx.storage.put('token', { id: shared.id, jwt: await token.get(iat), iat } satisfies KeptToken);
+    if (kept?.iat === iat && (kept.hold ?? 0) === hold && kept.id === shared.id) return;
+    await this.ctx.storage.put('token', { id: shared.id, jwt: await token.get(iat), iat, hold } satisfies KeptToken);
   }
 
   private async one(item: ApnsItem, token: ProviderToken, count: (k: string) => void): Promise<ApnsOutcome> {
@@ -115,13 +122,19 @@ export class PushSender extends DurableObject<Env> {
         status = 0; // no answer
       }
       count(reason ? `${status} ${reason}` : String(status));
-      // An expired token is renewed (unless under 20 minutes old) and the push tried once more.
+      // An expired token is renewed (unless under 20 minutes old) and the push tried once more. A
+      // new token APNs calls too soon goes back to the one before, and the push is tried once more.
       const expired = status === 403 && reason === 'ExpiredProviderToken';
       if (expired) token.expire(nowS);
-      const o = status === 0 || expired ? 'retry' : outcomeOf(status, reason);
+      let swapped = expired;
+      if (status === 429 && reason === 'TooManyProviderTokenUpdates') {
+        token.fallBack(nowS);
+        swapped = (await token.get(nowS)) !== jwt;
+      }
+      const o = status === 0 || swapped ? 'retry' : outcomeOf(status, reason);
       if (o !== 'retry') return o;
       if (attempt > 0) return 'failed';
-      if (!expired) await this.sleep(RETRY_MS);
+      if (!swapped) await this.sleep(RETRY_MS);
     }
   }
 }
