@@ -1,6 +1,6 @@
 import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { exports } from 'cloudflare:workers';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { type BoardRoom, freshMemory } from '../src/boardRoom';
 import { RENEW_AFTER_S } from '../src/push/live';
 import type { ApnsItem } from '../src/push/types';
@@ -357,6 +357,61 @@ describe('LIVE to Live Activity pushes', () => {
     expect(await row(b.id, 1)).toMatchObject({ activity_token: null, start_token: START_1 });
   });
 
+  it('the starter whose card APNs called gone is push-started in the same run', async () => {
+    const b = await board();
+    await registered(b, { startToken: START_1, activityToken: CARD_1 });
+    const sender = await fakeSender(b.id, (i) => (i.device === CARD_1 ? 'gone' : 'sent'));
+    b.send(live(0, [[1, blob(1)]], { starter: 1 }));
+    expect(toHex(await b.next())).toBe('0008000006');
+    await at(b, NOW + 20_000);
+    b.send(live(1, [[1, blob(1)]], { starter: 1 }));
+    await eventually(async () => (await sender.items()).length === 2);
+    expect((await sender.items())[1]).toMatchObject({ device: START_1 });
+    expect(aps((await sender.items())[1]).event).toBe('start');
+  });
+
+  it('a PUT that changes env keeps only the tokens it sends; its dropped card lets the starter be push-started', async () => {
+    const b = await board();
+    await registered(b, { startToken: START_1, activityToken: CARD_1, device: DEVICE_2 });
+    const sender = await fakeSender(b.id);
+    b.send(live(0, [[1, blob(1)]], { starter: 1 }));
+    await eventually(async () => (await sender.items()).length === 1);
+    expect((await sender.items())[0]).toMatchObject({ device: CARD_1, env: 'production' });
+    expect((await register(b.id, T1, { env: 'sandbox', startToken: START_2 })).status).toBe(204);
+    expect(toHex(await b.next())).toBe('0008000006');
+    expect(await row(b.id, 1)).toMatchObject({ env: 'sandbox', device: null, activity_token: null, start_token: START_2 });
+    await at(b, NOW + 20_000);
+    b.send(live(1, [[1, blob(1)]], { starter: 1 }));
+    await eventually(async () => (await sender.items()).length === 2);
+    expect((await sender.items())[1]).toMatchObject({ device: START_2, env: 'sandbox' });
+  });
+
+  it('a PUT with the same env keeps the tokens it does not send', async () => {
+    const b = await board();
+    await registered(b, { startToken: START_1, activityToken: CARD_1, device: DEVICE_2 });
+    expect((await register(b.id, T1, { env: 'production', offlineAfter: 30 })).status).toBe(204);
+    expect(await row(b.id, 1)).toMatchObject({ device: DEVICE_2, activity_token: CARD_1, start_token: START_1, lost_run: null });
+  });
+
+  it('logs the LIVE event and each send by kind, never a token', async () => {
+    const b = await board();
+    await registered(b, { startToken: START_1, activityToken: CARD_1 });
+    await fakeSender(b.id);
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((l: unknown) => void lines.push(String(l)));
+    try {
+      b.send(live(1, [[1, blob(1)], [2, blob(2)]], { starter: 1 }));
+      await eventually(async () => lines.some((l) => l.includes('live update')));
+    } finally {
+      spy.mockRestore();
+    }
+    const l = lines.find((x) => x.includes('live update'))!;
+    expect(l).toContain('live update (records for slot 1 2, started by slot 1): 2 sent, 0 gone, 0 failed');
+    expect(l).toContain('update to card production sent×1');
+    expect(l).toContain('start to start token sandbox sent×1');
+    expect(l).not.toContain(CARD_1);
+  });
+
   it('a row with no token left goes when APNs calls the last one gone', async () => {
     const b = await board();
     await registered(b, { startToken: START_1 });
@@ -551,6 +606,23 @@ describe('lost contact', () => {
     expect(await row(b.id, 1)).toMatchObject({ started_run: null });
     await alarmAt(b.id, gone + 120 * MIN);
     expect(await sender.items()).toHaveLength(3);
+  });
+
+  it('the board\'s frames move its last seen, at most once a minute', async () => {
+    const b = await board();
+    await registered(b, { startToken: START_1, activityToken: CARD_1 });
+    const seen = async () => (await rows(b.id, 'meta')).find((r) => r.key === 'last_seen')?.value;
+    await fakeSender(b.id);
+    await at(b, NOW + 2 * MIN);
+    b.send(live(1, [[1, blob(1)]]));
+    await eventually(async () => (await seen()) === NOW_S + 120);
+    await at(b, NOW + 2 * MIN + 30_000);
+    b.send(live(1, [[1, blob(1)]]));
+    expect(await b.quiet(100)).toBe(true);
+    expect(await seen()).toBe(NOW_S + 120);
+    await at(b, NOW + 3 * MIN);
+    b.send(live(1, [[1, blob(1)]]));
+    await eventually(async () => (await seen()) === NOW_S + 180);
   });
 
   it('a board back within 10 minutes sends nothing', async () => {

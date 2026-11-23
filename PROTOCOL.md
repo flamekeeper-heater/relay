@@ -99,7 +99,8 @@ the slot's registration, and a slot's first PUT must carry `env` and `device`:
 | `activityStartedAt` | when that card started, UTC seconds |
 | `iosVersion` | `major.minor[.patch]` |
 
-A slot's first PUT carries `env` and at least one of `device`, `startToken`, `activityToken`.
+A slot's first PUT carries `env` and at least one of `device`, `startToken`, `activityToken`. A PUT
+that changes `env` keeps only the tokens it sends (tokens belong to one APNs environment).
 `DELETE …/push/activity` with `{"reason": "ended" | "dismissed", "activityToken": <the card's
 update token>}` (both optional; no body: the current card ended) drops the card's token if it is
 still the registered one; `dismissed` (the user swiped the card away) also stops push-to-start to
@@ -140,11 +141,11 @@ The relay turns each blob into an APNs request with `apns-push-type: liveactivit
 | Case | APNs event | To |
 |---|---|---|
 | start or update, the phone has a card | `update` | its card's token |
-| start or update, no card | `start` (push-to-start) | its start token; never the run's starter, nor a phone that swiped its card away in this run, and once per run |
+| start or update, no card | `start` (push-to-start) | its start token; never the run's starter (unless its card token was lost in this run: APNs refused it, or an `env` change dropped it), nor a phone that swiped its card away in this run, and once per run |
 | end | `end`, `dismissal-date` now + the board's dismissal s; the card's token is then dropped | its card's token |
 | a card token registered after its run ended, for a card that started before the end | `end` at once, `dismissal-date` the run's | that token |
 | an update 7 h 45 min after the card started | `start` with `relay.renewed`, then `end` (dismissal now) to the old card | start token, card token |
-| board away 10 min | `update` with `relay.lostAt` (last seen) and the last blob | card tokens |
+| board away 10 min | `update` with `relay.lostAt` (last seen: the board's last frame, to the minute) and the last blob | card tokens |
 | board away 60 min | `end`, dismissal 900 s, then the tokens are dropped | card tokens |
 
 `aps`: `timestamp` (now), `event`, `content-state`, `stale-date` (now + the board's stale s) for

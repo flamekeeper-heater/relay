@@ -135,6 +135,7 @@ describe('push registrations', () => {
         ios: null,
         dismissed_run: null,
         started_run: null,
+        lost_run: null,
         live_blob: null,
         live_event: null,
       },

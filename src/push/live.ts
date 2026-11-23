@@ -40,6 +40,8 @@ export type LiveRow = {
   dismissed_run: number | null;
   /** The run in which the relay sent this phone a push-to-start (none again in that run). */
   started_run: number | null;
+  /** The run in which this phone's card was lost (APNs refused its token): it may be push-started. */
+  lost_run: number | null;
   /** The last blob the board sealed for this phone, and its LIVE event. */
   live_blob: ArrayBuffer | null;
   live_event: number | null;
@@ -109,9 +111,10 @@ export function liveRequests(l: Live, rows: LiveRow[], o: LiveContext): LiveSend
       out.push({ slot, token: 'activity', item: endItem(r, card!, contentState(blob, l.event, r.activity_started), o.nowS, 0), after: 'forgetCard' });
       continue;
     }
-    // No card: start one, unless this phone started the run (its app made its own card), swiped the
-    // card away in this run, or was already sent a start in this run.
-    if (r.start_token && slot !== l.starter && r.dismissed_run !== o.run && r.started_run !== o.run) {
+    // No card: start one, unless this phone started the run (its app made its own card, unless that
+    // card was lost since), swiped the card away in this run, or was already sent a start in this run.
+    const ownCard = slot === l.starter && r.lost_run !== o.run;
+    if (r.start_token && !ownCard && r.dismissed_run !== o.run && r.started_run !== o.run) {
       out.push({ slot, token: 'start', item: startItem(r, blob, l.event, o, staleS), after: 'started' });
     }
   }

@@ -88,12 +88,15 @@ const LIVE_COLUMNS: Array<[name: string, type: string]> = [
   ['ios', 'TEXT'],
   ['dismissed_run', 'INTEGER'],
   ['started_run', 'INTEGER'],
+  ['lost_run', 'INTEGER'],
   ['live_blob', 'BLOB'],
   ['live_event', 'INTEGER'],
 ];
-const LIVE_SELECT = `slot, env, start_token, activity_token, activity_started, ios, dismissed_run, started_run, live_blob, live_event`;
+const LIVE_SELECT = `slot, env, start_token, activity_token, activity_started, ios, dismissed_run, started_run, lost_run, live_blob, live_event`;
 
 const SIGN_IN_MS = 10_000;
+/** The board's frames move its last seen at most this often. */
+const SEEN_WRITE_MS = 60_000;
 const FORGET_MS = 90 * 24 * 3600 * 1000;
 const CHANNELS = [1, 2, 3];
 /** Bad tokens in a minute that make a log line (they are only counted: a token is 256 bits). */
@@ -128,6 +131,8 @@ export interface Memory {
   channels: Map<number, WebSocket> | null;
   /** The token bucket of each channel's app → board messages. */
   buckets: Map<number, { tokens: number; at: number }>;
+  /** When the board's last frame was written down as last seen (ms; 0: not in this life). */
+  seenWritten: number;
 }
 
 export function freshMemory(): Memory {
@@ -137,6 +142,7 @@ export function freshMemory(): Memory {
     badTokens: { windowStart: 0, count: 0 },
     channels: null,
     buckets: new Map(),
+    seenWritten: 0,
   };
 }
 
@@ -232,6 +238,7 @@ export class BoardRoom extends DurableObject<Env> {
       await this.signIn(ws, a, m);
       return;
     }
+    this.boardHeard();
     if (m[0] !== 0) {
       // An app frame for channel m[0]; dropped when no phone holds that channel.
       const app = this.channels().get(m[0]);
@@ -414,37 +421,44 @@ export class BoardRoom extends DurableObject<Env> {
       const patch = parseRegistration(text);
       if (!patch) return reply(400, 'Bad registration');
       const row = sql
-        .exec<{ kind: string; env: string; device: string | null; offline_after: number; start_token: string | null; activity_token: string | null; activity_started: number | null; ios: string | null; dismissed_run: number | null }>(
-          `SELECT kind, env, device, offline_after, start_token, activity_token, activity_started, ios, dismissed_run FROM push WHERE slot = ?`,
+        .exec<{ kind: string; env: string; device: string | null; offline_after: number; start_token: string | null; activity_token: string | null; activity_started: number | null; ios: string | null; dismissed_run: number | null; lost_run: number | null }>(
+          `SELECT kind, env, device, offline_after, start_token, activity_token, activity_started, ios, dismissed_run, lost_run FROM push WHERE slot = ?`,
           slot,
         )
         .toArray()[0];
       const anyToken = [patch.device, patch.startToken, patch.activityToken].some((t) => typeof t === 'string');
       if (!row && (patch.env === undefined || !anyToken)) return reply(400, 'Bad registration');
+      // Tokens belong to one APNs environment: a phone that changes it (a Debug build over a
+      // TestFlight one) keeps only the tokens it sends again.
+      const envChanged = row !== undefined && patch.env !== undefined && patch.env !== row.env;
+      const kept = envChanged ? undefined : row;
       const pick = <T>(v: T | undefined, old: T): T => (v !== undefined ? v : old);
-      const activityToken = pick(patch.activityToken, row?.activity_token ?? null);
+      const activityToken = pick(patch.activityToken, kept?.activity_token ?? null);
+      // A card dropped this way is lost: the phone may be push-started even if it started the run.
+      const cardLost = envChanged && row.activity_token !== null && activityToken === null;
       sql.exec(
-        `INSERT INTO push (slot, kind, env, device, offline_after, updated, start_token, activity_token, activity_started, ios, dismissed_run)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO push (slot, kind, env, device, offline_after, updated, start_token, activity_token, activity_started, ios, dismissed_run, lost_run)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (slot) DO UPDATE SET kind = excluded.kind, env = excluded.env, device = excluded.device,
            offline_after = excluded.offline_after, updated = excluded.updated, start_token = excluded.start_token,
            activity_token = excluded.activity_token, activity_started = excluded.activity_started, ios = excluded.ios,
-           dismissed_run = excluded.dismissed_run`,
+           dismissed_run = excluded.dismissed_run, lost_run = excluded.lost_run`,
         slot,
         patch.kind ?? row?.kind ?? 'apns',
         patch.env ?? row!.env,
-        pick(patch.device, row?.device ?? null),
+        pick(patch.device, kept?.device ?? null),
         patch.offlineAfter ?? row?.offline_after ?? 0,
         Math.floor(this.clock() / 1000),
-        pick(patch.startToken, row?.start_token ?? null),
+        pick(patch.startToken, kept?.start_token ?? null),
         activityToken,
         // A card's start belongs to its token: a new token without one has none.
         activityToken === null
           ? null
-          : pick(patch.activityStartedAt, activityToken === row?.activity_token ? (row?.activity_started ?? null) : null),
+          : pick(patch.activityStartedAt, activityToken === kept?.activity_token ? (kept?.activity_started ?? null) : null),
         patch.iosVersion ?? row?.ios ?? null,
         // A new card is the phone wanting one again.
         typeof patch.activityToken === 'string' ? null : (row?.dismissed_run ?? null),
+        cardLost ? this.meta('live_run') : (row?.lost_run ?? null),
       );
       log(id, `push slot ${slot} set`);
       if (typeof patch.activityToken === 'string') lateEnd = this.lateEnd(slot);
@@ -531,7 +545,7 @@ export class BoardRoom extends DurableObject<Env> {
     }
     const sends = liveRequests(l, this.liveRows(), { relayId: id, nowS, run });
     await this.deliver(
-      'live',
+      `live ${LIVE_EVENTS[l.event] ?? l.event} (records for ${l.blobs.size === 0 ? 'no slot' : `slot ${[...l.blobs.keys()].join(' ')}`}${l.starter === null ? '' : `, started by slot ${l.starter}`})`,
       sends.map((x) => ({ ...x, run })),
     );
   }
@@ -719,14 +733,26 @@ export class BoardRoom extends DurableObject<Env> {
     const before = this.registrations();
     const sql = this.ctx.storage.sql;
     const n = { sent: 0, gone: 0, failed: 0 };
+    // What each send was (its Live Activity event, or alert) to which kind of token and host.
+    const kinds = new Map<string, number>();
     sends.forEach(({ slot, item, token = 'device', after, run }, i) => {
       const o = outcomes[i] ?? 'failed';
       n[o]++;
+      const k = `${pushEvent(item.payload)} to ${TOKEN_NAMES[token]} ${item.env} ${o}`;
+      kinds.set(k, (kinds.get(k) ?? 0) + 1);
       // Only the token APNs refused or the card that ended (if APNs took the end): the phone may
       // have registered a new one meanwhile.
       if (o === 'gone' || (after === 'forgetCard' && o === 'sent')) {
         if (token === 'activity') {
-          sql.exec(`UPDATE push SET activity_token = NULL, activity_started = NULL WHERE slot = ? AND activity_token = ?`, slot, item.device);
+          // A card APNs refused is lost (the app reinstalled, or another environment): the phone may
+          // be push-started again in this run, even if it started the run.
+          sql.exec(
+            `UPDATE push SET activity_token = NULL, activity_started = NULL, lost_run = CASE WHEN ? THEN ? ELSE lost_run END WHERE slot = ? AND activity_token = ?`,
+            o === 'gone' ? 1 : 0,
+            o === 'gone' ? this.meta('live_run') : null,
+            slot,
+            item.device,
+          );
         } else if (token === 'start') {
           if (o === 'gone') sql.exec(`UPDATE push SET start_token = NULL WHERE slot = ? AND start_token = ?`, slot, item.device);
         } else {
@@ -736,7 +762,7 @@ export class BoardRoom extends DurableObject<Env> {
       }
       if (after === 'started' && o === 'sent' && run !== undefined) sql.exec(`UPDATE push SET started_run = ? WHERE slot = ?`, run, slot);
     });
-    log(id, `${what}: ${n.sent} sent, ${n.gone} gone, ${n.failed} failed`);
+    log(id, `${what}: ${n.sent} sent, ${n.gone} gone, ${n.failed} failed (${[...kinds].map(([k, c]) => `${k}×${c}`).join(', ')})`);
     this.wantIfChanged(before);
     return outcomes;
   }
@@ -943,6 +969,17 @@ export class BoardRoom extends DurableObject<Env> {
     else this.ctx.storage.sql.exec(`INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`, key, value);
   }
 
+  /**
+   * A frame from the signed-in board: it is last seen now, written at most once a minute. A socket
+   * that dies without a close still leaves a last seen close to its last frame.
+   */
+  private boardHeard(): void {
+    const now = this.clock();
+    if (now >= this.mem.seenWritten && now - this.mem.seenWritten < SEEN_WRITE_MS) return;
+    this.setLastSeen();
+    this.mem.seenWritten = now;
+  }
+
   private setLastSeen(): void {
     this.ensureSchema();
     this.ctx.storage.sql.exec(
@@ -1087,6 +1124,15 @@ function fromHex(s: string): Uint8Array {
   const out = new Uint8Array(s.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(s.slice(i * 2, i * 2 + 2), 16);
   return out;
+}
+
+const LIVE_EVENTS = ['start', 'update', 'end'];
+const TOKEN_NAMES = { device: 'device', start: 'start token', activity: 'card' } as const;
+
+/** A push payload's Live Activity event (start, update, end), or `alert`. */
+function pushEvent(payload: unknown): string {
+  const e = (payload as { aps?: { event?: unknown } } | null)?.aps?.event;
+  return typeof e === 'string' && /^[a-z]{1,10}$/.test(e) ? e : 'alert';
 }
 
 /** Logs carry board ids, events and close codes; never frames, tokens or addresses. */
