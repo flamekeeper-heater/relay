@@ -35,7 +35,9 @@
   // the Cloudflare account: change these if another Worker there uses them.
   "ratelimits": [
     { "name": "BOARD_CONNECTS", "namespace_id": "4001", "simple": { "limit": 20, "period": 60 } },
-    { "name": "APP_CONNECTS", "namespace_id": "4002", "simple": { "limit": 60, "period": 60 } }
+    { "name": "APP_CONNECTS", "namespace_id": "4002", "simple": { "limit": 60, "period": 60 } },
+    // PUSH messages per board id a minute (an alarm, class 3, is never limited).
+    { "name": "PUSH_RATE", "namespace_id": "4003", "simple": { "limit": 20, "period": 60 } }
   ],
 
   "env": {
@@ -47,12 +49,16 @@
       "durable_objects": {
         "bindings": [
           { "name": "BOARD", "class_name": "BoardRoom" },
-          { "name": "PUSH", "class_name": "PushSender" }
+          // The official relay's APNs sender: both deployments sign with one APNs key, and Apple
+          // refuses a key's new provider tokens more often than every 20 minutes, so one object
+          // makes them. With an APNs key of its own, drop "script_name".
+          { "name": "PUSH", "class_name": "PushSender", "script_name": "flamekeeper-relay" }
         ]
       },
       "ratelimits": [
         { "name": "BOARD_CONNECTS", "namespace_id": "4011", "simple": { "limit": 20, "period": 60 } },
-        { "name": "APP_CONNECTS", "namespace_id": "4012", "simple": { "limit": 60, "period": 60 } }
+        { "name": "APP_CONNECTS", "namespace_id": "4012", "simple": { "limit": 60, "period": 60 } },
+        { "name": "PUSH_RATE", "namespace_id": "4013", "simple": { "limit": 20, "period": 60 } }
       ]
     }
   }

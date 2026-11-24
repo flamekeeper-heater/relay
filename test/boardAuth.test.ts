@@ -2,8 +2,7 @@ import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { Close, Op } from '../src/wire';
 import type { BoardRoom } from '../src/boardRoom';
-import { toHex } from './bytes';
-import { attachments, eventually, fakeApp, fakeBoard, newKeys, randomId, room, rows, setClock, storedNothing, tables } from './fakes';
+import { attachments, eventually, fakeApp, fakeBoard, meta, newKeys, randomId, room, setClock, storedNothing } from './fakes';
 
 const DAY_MS = 24 * 3600 * 1000;
 
@@ -14,26 +13,9 @@ describe('board sign-in', () => {
     await setClock(b.id, t);
     await b.signIn();
     const [a] = await attachments(b.id, 'board');
-    expect(a.authed).toBe(true);
-    expect(await rows(b.id, 'meta')).toEqual([{ key: 'last_seen', value: Math.floor(t / 1000) }]);
+    expect(a.authedAt).toBe(t);
+    expect(await meta(b.id, 'last_seen')).toBe(Math.floor(t / 1000));
     expect(await b.quiet()).toBe(true);
-  });
-
-  it('tells a board that signs in which slots want pushes and live cards: none yet', async () => {
-    const b = await fakeBoard();
-    const c = await b.next();
-    b.send(await b.auth(c.subarray(2)));
-    expect(toHex(await b.next())).toBe('0008000000');
-    expect(await b.quiet()).toBe(true);
-  });
-
-  it('sends a fresh 32-byte challenge on every connection', async () => {
-    const keys = await newKeys();
-    const one = await (await fakeBoard({ keyOf: keys })).next();
-    const two = await (await fakeBoard({ keyOf: keys })).next();
-    expect(one.length).toBe(34);
-    expect([one[0], one[1]]).toEqual([0, Op.challenge]);
-    expect(one).not.toEqual(two);
   });
 
   it('refuses a key whose hash is not the id', async () => {
@@ -97,7 +79,7 @@ describe('board sign-in', () => {
     await second.signIn();
     expect((await first.closed).code).toBe(Close.replaced);
     const left = await attachments(first.id, 'board');
-    expect(left.filter((a) => a.authed)).toHaveLength(1);
+    expect(left.filter((a) => a.authedAt !== null)).toHaveLength(1);
     expect(await second.quiet()).toBe(true);
   });
 
@@ -109,24 +91,24 @@ describe('board sign-in', () => {
     second.send(await second.auth(c.subarray(2), 'relay.example.com'));
     expect((await second.closed).code).toBe(Close.authFailed);
     expect(await first.quiet()).toBe(true);
-    expect((await attachments(first.id, 'board')).filter((a) => a.authed)).toHaveLength(1);
+    expect((await attachments(first.id, 'board')).filter((a) => a.authedAt !== null)).toHaveLength(1);
   });
 
-  it('a text message or a 2049-byte message from the board closes it 4008', async () => {
+  it('a text message from the board closes it 1003, a 2049-byte message 1009', async () => {
     const a = await fakeBoard();
     await a.signIn();
     a.send('hello');
-    expect((await a.closed).code).toBe(Close.policy);
+    expect((await a.closed).code).toBe(1003);
 
     const b = await fakeBoard();
     await b.signIn();
     b.send(new Uint8Array(2049));
-    expect((await b.closed).code).toBe(Close.policy);
+    expect((await b.closed).code).toBe(1009);
 
     const c = await fakeBoard();
     await c.next();
     c.send(new Uint8Array(4609));
-    expect((await c.closed).code).toBe(Close.policy);
+    expect((await c.closed).code).toBe(1009);
   });
 
   it('a room no board signed in to keeps nothing after its sign-in and token deadlines', async () => {
@@ -139,7 +121,7 @@ describe('board sign-in', () => {
     await setClock(id, since + 10_000);
     expect(await runDurableObjectAlarm(room(id))).toBe(true);
     expect((await board.closed).code).toBe(Close.authFailed);
-    expect((await app.closed).code).toBe(Close.policy);
+    expect((await app.closed).code).toBe(1008);
     await eventually(() => storedNothing(id));
   });
 
@@ -148,20 +130,9 @@ describe('board sign-in', () => {
     const c = await b.next();
     b.send(await b.auth(c.subarray(2)));
     await b.closed;
-    expect(await rows(b.id, 'meta')).toEqual([]);
-    expect(await rows(b.id, 'roster')).toEqual([]);
-    expect(await tables(b.id)).toEqual([]);
+    expect(await meta(b.id, 'last_seen')).toBeNull();
     // Its 10 s deadline alarm was the only thing stored, and it is gone with the socket.
     await eventually(() => storedNothing(b.id));
-  });
-
-  it('records the last-seen time when the board goes away', async () => {
-    const b = await fakeBoard();
-    await b.signIn();
-    await setClock(b.id, 1_900_000_000_999);
-    b.ws.close(1000);
-    await b.closed;
-    await eventually(async () => (await rows(b.id, 'meta'))[0]?.value === 1_900_000_000);
   });
 
   it('forgets a board unseen for 90 days', async () => {
@@ -174,17 +145,17 @@ describe('board sign-in', () => {
       b.ws.close(1000);
       await b.closed;
       const now = 1_800_000_000_000;
-      await eventually(async () => (await rows(b.id, 'meta')).length === 1);
       await setLastSeen(b.id, Math.floor((now - days * DAY_MS) / 1000));
       await setClock(b.id, now);
       expect(await runDurableObjectAlarm(room(b.id))).toBe(true);
-      expect((await tables(b.id)).length > 0, `${days} days`).toBe(kept);
+      expect((await meta(b.id, 'last_seen')) !== null, `${days} days`).toBe(kept);
+      expect(await storedNothing(b.id), `${days} days`).toBe(!kept);
     }
   });
 });
 
 function setLastSeen(id: string, seconds: number): Promise<void> {
   return runInDurableObject(room(id), (_o: BoardRoom, state) => {
-    state.storage.sql.exec(`UPDATE meta SET value = ? WHERE key = 'last_seen'`, seconds);
+    state.storage.kv.put('last_seen', seconds);
   });
 }

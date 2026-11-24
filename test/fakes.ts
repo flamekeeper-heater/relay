@@ -1,12 +1,16 @@
 // A fake board and a fake phone that talk to the relay through the Worker, as real ones would.
 
 import { env, exports } from 'cloudflare:workers';
-import { runInDurableObject } from 'cloudflare:test';
+import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { base32, boardIdOf } from '../src/boardId';
+import { base64url } from '../src/bytes';
 import type { BoardRoom } from '../src/boardRoom';
 import type { ApnsItem, ApnsOutcome } from '../src/push/types';
 import { Op, SUBPROTOCOL, authSignedBytes } from '../src/wire';
+import type { MetaKey } from '../src/store';
 import { concat, toHex } from './bytes';
+
+export { base64url };
 
 export const HOST = 'relay.flamekeeper.app';
 const WAIT_MS = 2000;
@@ -113,6 +117,15 @@ export async function newKeys(): Promise<CryptoKeyPair> {
   return (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])) as CryptoKeyPair;
 }
 
+/** A fresh P-256 key, its private half as a .p8 file's contents (PKCS#8 PEM). */
+export async function testKey(): Promise<{ pem: string; publicKey: CryptoKey }> {
+  const pair = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])) as CryptoKeyPair;
+  const der = new Uint8Array((await crypto.subtle.exportKey('pkcs8', pair.privateKey)) as ArrayBuffer);
+  const b64 = btoa(String.fromCharCode(...der));
+  const lines = b64.match(/.{1,64}/g)!.join('\n');
+  return { pem: `-----BEGIN PRIVATE KEY-----\n${lines}\n-----END PRIVATE KEY-----\n`, publicKey: pair.publicKey };
+}
+
 export async function fakeBoard(
   o: { host?: string; firmware?: string; keyOf?: CryptoKeyPair; id?: string; via?: DurableObjectStub<BoardRoom> } = {},
 ): Promise<FakeBoardSocket> {
@@ -157,26 +170,23 @@ export async function fakeApp(id: string, token?: Uint8Array): Promise<FakeAppSo
   return s;
 }
 
-/** Unpadded base64url, as the app sends its relay token. */
-export function base64url(b: Uint8Array): string {
-  return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
-
 /** A phone's push registration call: `PUT` (or `DELETE`) `/v1/app/<id>/push` with its relay token. */
-export function register(
-  id: string,
-  token: Uint8Array,
-  body: object | null,
-  method: 'PUT' | 'DELETE' = 'PUT',
-  host = HOST,
-): Promise<Response> {
-  const headers: Record<string, string> = { Authorization: `Bearer ${base64url(token)}`, 'CF-Connecting-IP': freshIp() };
-  if (body !== null) headers['Content-Type'] = 'application/json';
-  return exports.default.fetch(`https://${host}/v1/app/${id}/push`, {
+export function register(id: string, token: Uint8Array, body: object | null, method = 'PUT', path = ''): Promise<Response> {
+  return exports.default.fetch(`https://${HOST}/v1/app/${id}/push${path}`, {
     method,
-    headers,
+    headers: { Authorization: `Bearer ${base64url(token)}`, 'CF-Connecting-IP': freshIp() },
     body: body === null ? undefined : JSON.stringify(body),
   });
+}
+
+/** A phone's "my card ended" call. */
+export function cardEnd(id: string, token: Uint8Array, body: object | null): Promise<Response> {
+  return register(id, token, body, 'POST', '/activity/end');
+}
+
+/** What the relay logged while `spy` (on `console.log`) watched, one JSON string per line. */
+export function logged(spy: { mock: { calls: unknown[][] } }): string[] {
+  return spy.mock.calls.map((c) => JSON.stringify(c[0]));
 }
 
 /** Puts a recording APNs sender in the room; it answers `answer(item)` (default 'sent') per item. */
@@ -204,11 +214,27 @@ export async function eventually(check: () => boolean | Promise<boolean>): Promi
   }
 }
 
-/** Sets the room's clock (ms). */
-export function setClock(id: string, ms: number): Promise<void> {
+/** Sets the room's clock (ms); a board in it is taken as just heard (pass `heard` for its last keepalive). */
+export function setClock(id: string, ms: number, heard = ms): Promise<void> {
   return runInDurableObject(room(id), (o: BoardRoom) => {
     o.clock = () => ms;
+    o.pingAt = () => heard;
   });
+}
+
+/** One of the numbers the room keeps (`last_seen`, ...), or null. */
+export function meta(id: string, key: MetaKey): Promise<number | null> {
+  return runInDurableObject(room(id), (_o: BoardRoom, state) => state.storage.kv.get<number>(key) ?? null);
+}
+
+/** Runs the room's alarm at `ms`, whatever time it was set for. */
+export async function alarmAt(id: string, ms: number, heard = ms): Promise<void> {
+  await setClock(id, ms, heard);
+  await runDurableObjectAlarm(room(id));
+}
+
+export function alarmTime(id: string): Promise<number | null> {
+  return runInDurableObject(room(id), (_o: BoardRoom, state) => state.storage.getAlarm());
 }
 
 /** Rows of a table in the room's SQLite storage; [] when the table does not exist. */

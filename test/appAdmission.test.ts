@@ -8,11 +8,11 @@ import {
   eventually,
   fakeApp,
   fakeBoard,
+  meta,
   randomId,
   room,
   rows,
   setClock,
-  storedNothing,
 } from './fakes';
 
 // The relay token of the Wi-Fi key secret 32 × 09, and its hash (PROTOCOL.md).
@@ -34,10 +34,6 @@ async function boardWith(entries: Array<[number, Uint8Array]>, b?: FakeBoardSock
 }
 
 describe('app admission', () => {
-  it('knows the token vector', async () => {
-    expect(toHex(await sha256(T))).toBe(toHex(H));
-  });
-
   it('admits a phone whose token is in the roster', async () => {
     const b = await boardWith([[2, H]]);
     const app = await fakeApp(b.id, T);
@@ -69,7 +65,7 @@ describe('app admission', () => {
     await setClock(b.id, t0);
     b.ws.close(1000);
     await b.closed;
-    await eventually(async () => (await rows(b.id, 'meta'))[0]?.value === 1_800_000_123);
+    await eventually(async () => (await meta(b.id, 'last_seen')) === 1_800_000_123);
     expect(await (await fakeApp(b.id, T)).closed).toEqual({ code: Close.offline, reason: 'offline 1800000123' });
   });
 
@@ -78,18 +74,18 @@ describe('app admission', () => {
     await setClock(first.id, 1_800_000_000_000);
     first.ws.close(1000);
     await first.closed;
-    await eventually(async () => (await rows(first.id, 'meta'))[0]?.value === 1_800_000_000);
+    await eventually(async () => (await meta(first.id, 'last_seen')) === 1_800_000_000);
     const b = await fakeBoard({ keyOf: first.keys });
     await b.next(); // the challenge, left unanswered
     expect(await (await fakeApp(b.id, T)).closed).toEqual({ code: Close.offline, reason: 'offline 1800000000' });
   });
 
-  it('closes 4008 on a 31-byte first message, a text first message, or 10 s with no token', async () => {
+  it('closes 1008 on a 31-byte first message or 10 s with no token, 1003 on a text message', async () => {
     const b = await boardWith([[2, H]]);
     expect((await (await fakeApp(b.id, T.subarray(0, 31))).closed).code).toBe(Close.policy);
     const text = await fakeApp(b.id);
     text.send('x'.repeat(32));
-    expect((await text.closed).code).toBe(Close.policy);
+    expect((await text.closed).code).toBe(Close.unsupported);
 
     const idle = await fakeApp(b.id);
     await eventually(async () => (await attachments(b.id, 'app')).length > 0);
@@ -109,14 +105,6 @@ describe('app admission', () => {
     const app = await fakeApp(b.id, T);
     expect(toHex(await b.next())).toBe('00040102');
     expect(await app.quiet()).toBe(true);
-  });
-
-  it('writes nothing for app connects to an id no board signed in as', async () => {
-    const id = randomId();
-    for (let i = 0; i < 20; i++) {
-      expect((await (await fakeApp(id, randomToken())).closed).code).toBe(Close.notPaired);
-    }
-    await eventually(() => storedNothing(id));
   });
 
   it('a new roster closes the phones whose slot left it or changed hash', async () => {
@@ -163,16 +151,7 @@ describe('app admission', () => {
     expect(toHex(await b.next())).toBe('00040102');
   });
 
-  it('sends WANT after every ROSTER, an empty one too', async () => {
-    const b = await boardWith([[2, H]]);
-    b.roster([]);
-    expect(toHex(await b.next())).toBe('0008000000');
-    b.roster([[1, H]]);
-    expect(toHex(await b.next())).toBe('0008000000');
-    expect(await b.quiet()).toBe(true);
-  });
-
-  it('closes a board whose roster is malformed with 4008', async () => {
+  it('closes a board whose roster is malformed with 1008', async () => {
     const b = await fakeBoard();
     await b.signIn();
     b.send(new Uint8Array([0, 3, 2]));

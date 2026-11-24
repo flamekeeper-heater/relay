@@ -1,26 +1,27 @@
-// The relay's wire format (PROTOCOL.md). Every message is binary: u8 channel, then
-// the content. Channel 0 is the board and the relay talking (u8 op, then data); channels 1-3 carry
-// one phone's app frames, which the relay never reads. Multi-byte numbers are little-endian.
+// The relay's wire format (PROTOCOL.md). Every message is binary: u8 channel, then the content.
+// Channel 0 is the board and the relay talking (u8 op, then data); channels 1-3 carry one phone's
+// app frames, which the relay never reads. Multi-byte numbers are little-endian.
 
-import { isBoardId } from './boardId';
+import { concat } from './bytes';
 
 export const SUBPROTOCOL = 'flamekeeper-relay.v1';
 
-/** A board's socket, a phone's socket, or a phone's push registration call (HTTP). */
-export type Role = 'board' | 'app' | 'push';
+/** A board's socket, a phone's socket, a phone's push registration call, or its "card ended" call. */
+export type Role = 'board' | 'app' | 'push' | 'cardEnd';
 
-const PATH = /^\/v1\/(board|app)\/([a-z2-7]{26})(\/push(\/activity)?)?$/;
+const PATH = /^\/v1\/(board|app)\/([a-z2-7]{26})(\/push(\/activity\/end)?)?$/;
 
-/**
- * The role and board id of a relay path (`/v1/board/<id>`, `/v1/app/<id>`, `/v1/app/<id>/push`,
- * `/v1/app/<id>/push/activity`: `activity` true), or null.
- */
-export function parsePath(pathname: string): { role: Role; id: string; activity?: boolean } | null {
+/** The role and board id of a relay path, or null. */
+export function parsePath(pathname: string): { role: Role; id: string } | null {
   const m = PATH.exec(pathname);
-  if (!m || !isBoardId(m[2])) return null;
-  if (m[3]) return m[1] === 'app' ? { role: 'push', id: m[2], activity: !!m[4] } : null;
-  return { role: m[1] as Role, id: m[2] };
+  if (!m) return null;
+  if (!m[3]) return { role: m[1] as Role, id: m[2] };
+  return m[1] === 'app' ? { role: m[4] ? 'cardEnd' : 'push', id: m[2] } : null;
 }
+
+/** The keepalive: a text message the relay answers without waking the board's room. */
+export const PING = 'ping';
+export const PONG = 'pong';
 
 /** The longest message the relay accepts either way (the board's frames are at most 1 + 1024 bytes). */
 export const MAX_MESSAGE = 2048;
@@ -28,12 +29,20 @@ export const MAX_MESSAGE = 2048;
 export const Op = { challenge: 1, auth: 2, roster: 3, open: 4, close: 5, push: 6, live: 7, want: 8 } as const;
 
 export const Close = {
+  /** The board sent no keepalive: taken as gone. */
+  silent: 1001,
+  /** A text message other than the keepalive. */
+  unsupported: 1003,
+  /** A bad first message, or no token within 10 s. */
+  policy: 1008,
+  tooBig: 1009,
   replaced: 4001,
   authFailed: 4002,
   notPaired: 4003,
   offline: 4004,
   full: 4005,
-  policy: 4008,
+  /** The board signed in again on a newer socket: connect again now. */
+  restarted: 4006,
 } as const;
 
 export const CHALLENGE_BYTES = 32;
@@ -53,10 +62,7 @@ export interface Auth {
 }
 
 export function encodeChallenge(c: Uint8Array): Uint8Array {
-  const m = new Uint8Array(2 + c.length);
-  m.set([0, Op.challenge]);
-  m.set(c, 2);
-  return m;
+  return concat(new Uint8Array([0, Op.challenge]), c);
 }
 
 /** `00 02` ‖ public key (65) ‖ signature r ‖ s (64) ‖ u8 n ‖ firmware version (n ≤ 32, UTF-8). */
@@ -82,18 +88,7 @@ export function decodeAuth(m: Uint8Array): Auth | null {
 export function authSignedBytes(challenge: Uint8Array, host: string, firmware: string): Uint8Array {
   const h = new TextEncoder().encode(host);
   const f = new TextEncoder().encode(firmware);
-  const out = new Uint8Array(SIGNED_PREFIX.length + challenge.length + 1 + h.length + 1 + f.length);
-  let o = 0;
-  out.set(SIGNED_PREFIX, o);
-  o += SIGNED_PREFIX.length;
-  out.set(challenge, o);
-  o += challenge.length;
-  out[o++] = h.length;
-  out.set(h, o);
-  o += h.length;
-  out[o++] = f.length;
-  out.set(f, o);
-  return out;
+  return concat(SIGNED_PREFIX, challenge, new Uint8Array([h.length]), h, new Uint8Array([f.length]), f);
 }
 
 /** `00 03` ‖ u8 format 1 ‖ n × (u8 slot 0-7, SHA-256(T) 32 bytes), n ≤ 8, slots unique. */
@@ -116,27 +111,28 @@ const BLOB_MIN = 28;
 const CLASS_MAX = 3;
 
 /**
- * PUSH: `00 06` ‖ u8 class 0-3 ‖ u8 n ≤ 8 ‖ n × (u8 slot 0-7, u8 length ≥ 28, blob); slots unique,
- * the lengths exactly filling the message. The blobs are the board's, encrypted per phone.
+ * The blobs that end a PUSH or a LIVE: `n` × (u8 slot 0-7, u8 length ≥ 28, blob) from offset `o`,
+ * slots unique, the lengths exactly filling the message. The blobs are the board's, sealed per phone.
  */
-export function decodePush(m: Uint8Array): { cls: number; blobs: Array<{ slot: number; blob: Uint8Array }> } | null {
-  if (m.length < 4 || m[0] !== 0 || m[1] !== Op.push) return null;
-  const cls = m[2];
-  const n = m[3];
-  if (cls > CLASS_MAX || n > SLOTS) return null;
-  const blobs: Array<{ slot: number; blob: Uint8Array }> = [];
-  const seen = new Set<number>();
-  let o = 4;
+function decodeBlobs(m: Uint8Array, o: number, n: number): Map<number, Uint8Array> | null {
+  if (n > SLOTS) return null;
+  const blobs = new Map<number, Uint8Array>();
   for (let i = 0; i < n; i++) {
     if (o + 2 > m.length) return null;
     const slot = m[o];
     const length = m[o + 1];
-    if (slot >= SLOTS || seen.has(slot) || length < BLOB_MIN || o + 2 + length > m.length) return null;
-    seen.add(slot);
-    blobs.push({ slot, blob: m.slice(o + 2, o + 2 + length) });
+    if (slot >= SLOTS || blobs.has(slot) || length < BLOB_MIN || o + 2 + length > m.length) return null;
+    blobs.set(slot, m.slice(o + 2, o + 2 + length));
     o += 2 + length;
   }
-  return o === m.length ? { cls, blobs } : null;
+  return o === m.length ? blobs : null;
+}
+
+/** PUSH: `00 06` ‖ u8 class 0-3 ‖ u8 n ≤ 8 ‖ the blobs. */
+export function decodePush(m: Uint8Array): { cls: 0 | 1 | 2 | 3; blobs: Map<number, Uint8Array> } | null {
+  if (m.length < 4 || m[0] !== 0 || m[1] !== Op.push || m[2] > CLASS_MAX) return null;
+  const blobs = decodeBlobs(m, 4, m[3]);
+  return blobs && { cls: m[2] as 0 | 1 | 2 | 3, blobs };
 }
 
 export function encodeOpen(channel: number, slot: number): Uint8Array {
@@ -152,57 +148,49 @@ export function encodeWant(pushSlots: number, liveSlots: number, startSlots: num
 }
 
 export const LiveEvent = { start: 0, update: 1, end: 2 } as const;
+/** The events' names, as APNs and the logs say them. */
+export const LIVE_EVENT_NAMES = ['start', 'update', 'end'] as const;
 const NO_STARTER = 0xff;
+const LIVE_HEAD = 14;
 
 export interface Live {
-  /** 0 start, 1 update, 2 end. */
   event: 0 | 1 | 2;
-  /** Flags bit 0: APNs priority 10. */
+  /** Flags bit 0: APNs priority 10. (Bit 1, a fault end, is the board's and the app's.) */
   important: boolean;
-  /** Flags bit 1: the run ended on a fault or an alert (the longer dismissal). */
-  faultEnd: boolean;
   /** Seconds until the card goes grey. */
   staleS: number;
   /** For an end: seconds the final card stays. */
   dismissalS: number;
   /** The slot of the phone that started the run; null for none. */
   starter: number | null;
+  /** The board's id for this run, never 0. */
+  run: number;
   /** Per slot, the live record sealed for that phone. */
   blobs: Map<number, Uint8Array>;
 }
 
 /**
  * LIVE: `00 07` ‖ u8 event 0-2 ‖ u8 flags ‖ u16 stale s ‖ u16 dismissal s ‖ u8 starter slot
- * (0xFF none) ‖ u8 n ≤ 8 ‖ n × (u8 slot 0-7, u8 length ≥ 28, blob); slots unique, the lengths
- * exactly filling the message.
+ * (0xFF none) ‖ u32 run id (not 0) ‖ u8 n ≤ 8 ‖ the blobs.
  */
 export function decodeLive(m: Uint8Array): Live | null {
-  if (m.length < 10 || m[0] !== 0 || m[1] !== Op.live) return null;
+  if (m.length < LIVE_HEAD || m[0] !== 0 || m[1] !== Op.live) return null;
   const event = m[2];
-  const flags = m[3];
   const starter = m[8];
-  const n = m[9];
-  if (event > 2 || (starter >= SLOTS && starter !== NO_STARTER) || n > SLOTS) return null;
-  const blobs = new Map<number, Uint8Array>();
-  let o = 10;
-  for (let i = 0; i < n; i++) {
-    if (o + 2 > m.length) return null;
-    const slot = m[o];
-    const length = m[o + 1];
-    if (slot >= SLOTS || blobs.has(slot) || length < BLOB_MIN || o + 2 + length > m.length) return null;
-    blobs.set(slot, m.slice(o + 2, o + 2 + length));
-    o += 2 + length;
-  }
-  if (o !== m.length) return null;
-  return {
-    event: event as 0 | 1 | 2,
-    important: (flags & 1) !== 0,
-    faultEnd: (flags & 2) !== 0,
-    staleS: m[4] | (m[5] << 8),
-    dismissalS: m[6] | (m[7] << 8),
-    starter: starter === NO_STARTER ? null : starter,
-    blobs,
-  };
+  const run = (m[9] | (m[10] << 8) | (m[11] << 16) | (m[12] << 24)) >>> 0;
+  if (event > LiveEvent.end || (starter >= SLOTS && starter !== NO_STARTER) || run === 0) return null;
+  const blobs = decodeBlobs(m, LIVE_HEAD, m[13]);
+  return (
+    blobs && {
+      event: event as 0 | 1 | 2,
+      important: (m[3] & 1) !== 0,
+      staleS: m[4] | (m[5] << 8),
+      dismissalS: m[6] | (m[7] << 8),
+      starter: starter === NO_STARTER ? null : starter,
+      run,
+      blobs,
+    }
+  );
 }
 
 export function encodeClose(channel: number, code: number): Uint8Array {

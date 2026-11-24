@@ -1,17 +1,18 @@
 import { runInDurableObject } from 'cloudflare:test';
 import { env } from 'cloudflare:workers';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Env as RelayEnv } from '../src/index';
-import { TOKEN_REUSE_S } from '../src/push/apns';
-import { PushSender, outcomeOf, resetProviderToken } from '../src/push/pushSender';
+import { TOKEN_MIN_S, TOKEN_REUSE_S } from '../src/push/apns';
+import { type PushSender, outcomeOf } from '../src/push/pushSender';
 import type { ApnsItem } from '../src/push/types';
-import { testKey } from './apns.test';
-import { hex, sha256, toHex } from './bytes';
-import { eventually, fakeBoard, register, rows } from './fakes';
+import { hex, toHex } from './bytes';
+import { eventually, fakeBoard, logged, register, rows, testKey } from './fakes';
 
 const T = hex('16c1df6a87aaeae336a68c3cb93442b2246922a2edaee096e2439ee205578c0a');
 const H = hex('d91429cfba5c46b38cfeb129eb4f263b616323ad4d7c20aeb3430d641258e834');
 const NOW = 1_900_000_000_000;
+
+const sender = () => (env as unknown as RelayEnv).PUSH.getByName('apns');
 
 interface Seen {
   url: string;
@@ -20,7 +21,7 @@ interface Seen {
 }
 
 /**
- * Sets up the one APNs sender with a real test key, a clock and a fake APNs that answers
+ * Sets up the one APNs sender afresh with a real test key, a clock and a fake APNs that answers
  * `answer(n)` to the n-th request (0-based): a status and a reason.
  */
 async function fakeApns(answer: (n: number) => [number, string?] = () => [200]) {
@@ -28,10 +29,11 @@ async function fakeApns(answer: (n: number) => [number, string?] = () => [200]) 
   const seen: Seen[] = [];
   const clock = { ms: NOW };
   const sleeps: number[] = [];
-  await runInDurableObject(env.PUSH.getByName('apns'), (o: PushSender) => {
+  await runInDurableObject(sender(), async (o: PushSender, state) => {
+    await state.storage.deleteAll();
+    o.token = null;
     (o as unknown as { env: RelayEnv }).env = { ...(env as unknown as RelayEnv), APNS_KEY_P8: pem };
     o.clock = () => clock.ms;
-    o.tokenReuseS = TOKEN_REUSE_S;
     o.sleep = async (ms) => {
       sleeps.push(ms);
     };
@@ -41,118 +43,99 @@ async function fakeApns(answer: (n: number) => [number, string?] = () => [200]) 
       seen.push(s);
       s.body = await r.json();
       const [status, reason] = answer(n);
-      return new Response(reason ? JSON.stringify({ reason }) : null, { status, headers: reason ? { 'apns-id': 'x' } : {} });
+      return new Response(reason ? JSON.stringify({ reason }) : null, { status });
     };
   });
   return { seen, clock, sleeps };
 }
 
+/** The sender loses its memory, as after an eviction or a deploy. */
+function restart(): Promise<void> {
+  return runInDurableObject(sender(), (o: PushSender) => {
+    o.token = null;
+  });
+}
+
 function send(items: ApnsItem[]) {
-  return env.PUSH.getByName('apns').send(items);
+  return sender().send(items);
 }
 
 const ITEM: ApnsItem = {
   env: 'sandbox',
-  device: 'aa'.repeat(32),
+  token: 'aa'.repeat(32),
   pushType: 'alert',
   priority: 10,
   expiration: NOW / 1000 + 86400,
   payload: { aps: { alert: { title: 'Flamekeeper', body: 'x' } } },
 };
 
-beforeEach(() => resetProviderToken());
 afterEach(() => vi.restoreAllMocks());
 
 describe('APNs outcomes', () => {
-  it.each([
-    [200, null, 'sent'],
-    [410, 'Unregistered', 'gone'],
-    [400, 'BadDeviceToken', 'gone'],
-    [400, 'DeviceTokenNotForTopic', 'gone'],
-    [400, 'BadPriority', 'failed'],
-    [403, 'InvalidProviderToken', 'failed'],
-    [403, 'ExpiredProviderToken', 'failed'],
-    [413, 'PayloadTooLarge', 'failed'],
-    [429, 'TooManyRequests', 'retry'],
-    [500, 'InternalServerError', 'retry'],
-    [503, 'ServiceUnavailable', 'retry'],
-  ] as const)('%i %s is %s', (status, reason, outcome) => {
-    expect(outcomeOf(status, reason)).toBe(outcome);
+  it('200 is sent, a dead token gone, 429, 5xx and no answer a retry, anything else failed', () => {
+    for (const [status, reason, outcome] of [
+      [200, null, 'sent'],
+      [410, 'Unregistered', 'gone'],
+      [400, 'BadDeviceToken', 'gone'],
+      [400, 'DeviceTokenNotForTopic', 'gone'],
+      [400, 'BadPriority', 'failed'],
+      [403, 'InvalidProviderToken', 'failed'],
+      [429, 'TooManyRequests', 'retry'],
+      [503, 'ServiceUnavailable', 'retry'],
+      [0, null, 'retry'],
+    ] as const) {
+      expect(outcomeOf(status, reason), `${status} ${reason}`).toBe(outcome);
+    }
   });
 });
 
 describe('APNs sender', () => {
   it('sends each item to its environment host with its headers and the provider token', async () => {
     const { seen } = await fakeApns();
-    const live: ApnsItem = { ...ITEM, env: 'production', device: 'bb'.repeat(32), pushType: 'liveactivity', priority: 5, payload: { aps: { event: 'update' } } };
-    expect(await send([ITEM, live])).toEqual(['sent', 'sent']);
+    const live: ApnsItem = { ...ITEM, env: 'production', token: 'bb'.repeat(32), pushType: 'liveactivity', priority: 5, payload: { aps: { event: 'update' } } };
+    expect(await send([{ ...ITEM, collapseId: 'x-offline' }, live])).toEqual(['sent', 'sent']);
     const byUrl = new Map(seen.map((s) => [s.url, s]));
     const a = byUrl.get(`https://api.sandbox.push.apple.com/3/device/${'aa'.repeat(32)}`)!;
     expect(a.headers['apns-topic']).toBe(env.BUNDLE_ID);
     expect(a.headers['apns-push-type']).toBe('alert');
     expect(a.headers['apns-priority']).toBe('10');
     expect(a.headers['apns-expiration']).toBe(String(ITEM.expiration));
+    expect(a.headers['apns-collapse-id']).toBe('x-offline');
     expect(a.headers.authorization).toMatch(/^bearer [\w-]+\.[\w-]+\.[\w-]+$/);
     expect(a.body).toEqual(ITEM.payload);
     const b = byUrl.get(`https://api.push.apple.com/3/device/${'bb'.repeat(32)}`)!;
     expect(b.headers['apns-topic']).toBe(`${env.BUNDLE_ID}.push-type.liveactivity`);
     expect(b.headers['apns-push-type']).toBe('liveactivity');
     expect(b.headers['apns-priority']).toBe('5');
+    expect(b.headers['apns-collapse-id']).toBeUndefined();
     expect(b.headers.authorization).toBe(a.headers.authorization);
   });
 
-  it('reuses the provider token for 40 minutes', async () => {
+  it('uses one provider token for 50 minutes, across a restart of the sender too', async () => {
     const { seen, clock } = await fakeApns();
-    await send([ITEM]);
+    await send([ITEM, ITEM]);
+    await restart();
     clock.ms = NOW + (TOKEN_REUSE_S - 1) * 1000;
     await send([ITEM]);
     clock.ms = NOW + TOKEN_REUSE_S * 1000;
-    await send([ITEM]);
+    await send([ITEM, ITEM]);
     const tokens = seen.map((s) => s.headers.authorization);
-    expect(tokens[1]).toBe(tokens[0]);
-    expect(tokens[2]).not.toBe(tokens[0]);
+    expect(new Set(tokens.slice(0, 3)).size).toBe(1);
+    expect(tokens[3]).not.toBe(tokens[0]);
+    expect(tokens[4]).toBe(tokens[3]);
   });
 
-  it('keeps the provider token across a restart of the sender', async () => {
-    const { seen } = await fakeApns();
+  it('a token APNs calls expired is replaced and the push goes again at once, but never under 20 minutes', async () => {
+    const { seen, clock, sleeps } = await fakeApns((n) => (n === 1 || n === 3 || n === 4 ? [403, 'ExpiredProviderToken'] : [200]));
     await send([ITEM]);
-    resetProviderToken();
-    await send([ITEM]);
-    expect(seen[1].headers.authorization).toBe(seen[0].headers.authorization);
-  });
-
-  it('an expired token is renewed and the push tried again at once', async () => {
-    const { seen, clock, sleeps } = await fakeApns((n) => (n === 1 ? [403, 'ExpiredProviderToken'] : [200]));
-    await send([ITEM]);
-    clock.ms = NOW + 1300 * 1000;
+    clock.ms = NOW + TOKEN_MIN_S * 1000;
     expect(await send([ITEM])).toEqual(['sent']);
     expect(seen).toHaveLength(3);
     expect(seen[2].headers.authorization).not.toBe(seen[1].headers.authorization);
+    clock.ms += (TOKEN_MIN_S - 1) * 1000;
+    expect(await send([ITEM])).toEqual(['failed']);
+    expect(seen[4].headers.authorization).toBe(seen[2].headers.authorization);
     expect(sleeps).toEqual([]);
-  });
-
-  it('a renewed token APNs calls too soon: the push goes again at once with the one before', async () => {
-    const { seen, clock, sleeps } = await fakeApns((n) => (n === 1 ? [429, 'TooManyProviderTokenUpdates'] : [200]));
-    await send([ITEM]);
-    clock.ms = NOW + TOKEN_REUSE_S * 1000;
-    expect(await send([ITEM])).toEqual(['sent']);
-    expect(seen).toHaveLength(3);
-    expect(seen[1].headers.authorization).not.toBe(seen[0].headers.authorization);
-    expect(seen[2].headers.authorization).toBe(seen[0].headers.authorization);
-    expect(sleeps).toEqual([]);
-    // The one before stays in use for 5 minutes, also across a restart of the sender.
-    resetProviderToken();
-    clock.ms += 60_000;
-    await send([ITEM]);
-    expect(seen[3].headers.authorization).toBe(seen[0].headers.authorization);
-  });
-
-  it('the first token APNs calls too soon is tried once more after 2 s', async () => {
-    const { seen, sleeps } = await fakeApns((n) => (n === 0 ? [429, 'TooManyProviderTokenUpdates'] : [200]));
-    expect(await send([ITEM])).toEqual(['sent']);
-    expect(seen).toHaveLength(2);
-    expect(seen[1].headers.authorization).toBe(seen[0].headers.authorization);
-    expect(sleeps).toEqual([2000]);
   });
 
   it('tries a 503 once more after 2 s, then gives up', async () => {
@@ -166,19 +149,12 @@ describe('APNs sender', () => {
     expect(always.seen).toHaveLength(2);
   });
 
-  it('calls a 410 gone and a bad request failed, without retrying', async () => {
-    const { seen } = await fakeApns((n) => (n === 0 ? [410, 'Unregistered'] : [400, 'BadPriority']));
-    expect(await send([ITEM])).toEqual(['gone']);
-    expect(await send([ITEM])).toEqual(['failed']);
-    expect(seen).toHaveLength(2);
-  });
-
-  it('logs counts per status, never a token or a payload', async () => {
+  it('logs counts per answer, never a token or a payload', async () => {
     const log = vi.spyOn(console, 'log');
     await fakeApns((n) => (n === 0 ? [200] : [400, 'BadDeviceToken']));
-    await send([ITEM, { ...ITEM, device: 'cc'.repeat(32) }]);
-    const lines = log.mock.calls.map((c) => c.join(' ')).filter((l) => l.startsWith('apns'));
-    expect(lines.some((l) => l.includes('200×1') && l.includes('400 BadDeviceToken×1'))).toBe(true);
+    await send([ITEM, { ...ITEM, token: 'cc'.repeat(32) }]);
+    const lines = logged(log);
+    expect(lines).toContain(JSON.stringify({ event: 'apns', answers: { '200': 1, '400 BadDeviceToken': 1 } }));
     for (const l of lines) {
       expect(l).not.toContain('aa'.repeat(32));
       expect(l).not.toContain('cc'.repeat(32));
@@ -191,12 +167,11 @@ describe('APNs sender', () => {
     const b = await fakeBoard();
     await b.signIn();
     b.roster([[2, H]]);
-    expect(toHex(await b.next())).toBe('0008000000');
+    await b.next();
     expect((await register(b.id, T, { env: 'sandbox', device: 'aa'.repeat(32) })).status).toBe(204);
     expect(toHex(await b.next())).toBe('0008040000');
     b.send(new Uint8Array([0, 6, 1, 1, 2, 40, ...new Uint8Array(40).fill(7)]));
     expect(toHex(await b.next())).toBe('0008000000');
-    await eventually(async () => (await rows(b.id, 'push')).length === 0);
-    expect(await sha256(T)).toEqual(H);
+    await eventually(async () => (await rows(b.id, 'registration')).length === 0);
   });
 });

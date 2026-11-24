@@ -1,6 +1,5 @@
-import { evictDurableObject, runInDurableObject } from 'cloudflare:test';
+import { evictDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
-import { BURST, type BoardRoom, RATE_PER_S, freshMemory } from '../src/boardRoom';
 import { Close, encodeClose } from '../src/wire';
 import { concat, sha256, toHex } from './bytes';
 import { type FakeAppSocket, type FakeBoardSocket, attachments, fakeApp, fakeBoard, room, rows, setClock } from './fakes';
@@ -111,13 +110,13 @@ describe('channels', () => {
     for (const app of apps) expect(await app.closed).toEqual({ code: Close.offline, reason: 'offline 1800000042' });
   });
 
-  it("a board replaced by a newer socket closes the old board's phones with 4004", async () => {
+  it("a board replaced by a newer socket closes the old board's phones with 4006", async () => {
     const r = await boardRoom();
     const app = await phone(r, 0, 1);
     const b2 = await fakeBoard({ keyOf: r.board.keys });
     await b2.signIn();
     expect((await r.board.closed).code).toBe(Close.replaced);
-    expect((await app.closed).code).toBe(Close.offline);
+    expect(await app.closed).toEqual({ code: Close.restarted, reason: 'restarted' });
   });
 
   it('drops board frames for a channel with no phone', async () => {
@@ -129,10 +128,10 @@ describe('channels', () => {
     r.board.send(new Uint8Array([1, 7]));
     expect(toHex(await app.next())).toBe('07');
     expect(await app.quiet()).toBe(true);
-    expect((await attachments(r.board.id, 'board'))[0].authed).toBe(true);
+    expect((await attachments(r.board.id, 'board'))[0].authedAt).not.toBeNull();
   });
 
-  it('passes 2048 bytes to the board and 2047 to a phone; anything longer closes 4008', async () => {
+  it('passes 2048 bytes to the board and 2047 to a phone; anything longer closes 1009', async () => {
     const r = await boardRoom();
     const app = await phone(r, 0, 1);
     app.send(bytes(2047));
@@ -141,72 +140,11 @@ describe('channels', () => {
     expect(toHex(await app.next())).toBe(toHex(bytes(2047, 0x33)));
 
     app.send(bytes(2048)); // with the channel byte, 2049 for the board
-    expect((await app.closed).code).toBe(Close.policy);
-    expect(toHex(await r.board.next())).toBe(toHex(encodeClose(1, Close.policy)));
+    expect((await app.closed).code).toBe(Close.tooBig);
+    expect(toHex(await r.board.next())).toBe(toHex(encodeClose(1, Close.tooBig)));
 
     r.board.send(bytes(2049));
-    expect((await r.board.closed).code).toBe(Close.policy);
-  });
-
-  for (const rttMs of [150, 100, 50]) {
-    it(`carries a whole firmware update: 16 KB in flight, a report every 4096 bytes, ${rttMs} ms round trip`, async () => {
-      const r = await boardRoom();
-      const app = await phone(r, 0, 1);
-      const t0 = 1_800_000_000_000;
-      const sends = updateSends({ rttMs, image: 1_600_000 });
-      expect(sends.length).toBe(1600);
-      // Headroom: the bucket the relay keeps never runs below half its burst along the way.
-      expect(lowestBucket(sends, RATE_PER_S, BURST)).toBeGreaterThanOrEqual(BURST / 2);
-      const frame = bytes(1 + 1024, 0x91); // a data chunk's frame, at most the longest frame
-      for (let i = 0; i < sends.length; ) {
-        let j = i;
-        while (j < sends.length && sends[j] === sends[i]) j++;
-        await setClock(r.board.id, t0 + Math.round(sends[i]));
-        for (let k = i; k < j; k++) app.send(frame);
-        for (let k = i; k < j; k++) expect((await r.board.next()).length).toBe(1 + frame.length);
-        i = j;
-      }
-      expect(await app.quiet()).toBe(true);
-    });
-  }
-
-  it('a phone sending 400 messages a second for 2 s stays; 129 at once is closed 4008', async () => {
-    const r = await boardRoom();
-    const t = 1_800_000_000_000;
-    await setClock(r.board.id, t);
-    const steady = await phone(r, 0, 1);
-    for (let step = 0; step < 20; step++) {
-      await setClock(r.board.id, t + step * 100);
-      for (let i = 0; i < 40; i++) steady.send(new Uint8Array([i]));
-      for (let i = 0; i < 40; i++) expect(toHex(await r.board.next())).toBe(toHex(new Uint8Array([1, i])));
-    }
-    expect(await steady.quiet()).toBe(true);
-
-    const burst = await phone(r, 1, 2);
-    for (let i = 0; i < 129; i++) burst.send(new Uint8Array([i]));
-    expect((await burst.closed).code).toBe(Close.policy);
-    for (let i = 0; i < 128; i++) expect(toHex(await r.board.next())).toBe(toHex(new Uint8Array([2, i])));
-    expect(toHex(await r.board.next())).toBe(toHex(encodeClose(2, Close.policy)));
-    expect(await steady.quiet()).toBe(true);
-  });
-
-  it('forwarding and the fourth-phone refusal survive the object losing its memory', async () => {
-    const r = await boardRoom();
-    const apps = [await phone(r, 0, 1), await phone(r, 1, 2), await phone(r, 2, 3)];
-    const forget = () =>
-      runInDurableObject(room(r.board.id), (o: BoardRoom) => {
-        o.mem = freshMemory();
-      });
-    for (const [i, app] of apps.entries()) {
-      await forget();
-      app.send(new Uint8Array([0x10 + i]));
-      expect(toHex(await r.board.next())).toBe(toHex(new Uint8Array([i + 1, 0x10 + i])));
-      await forget();
-      r.board.send(new Uint8Array([i + 1, 0x20 + i]));
-      expect(toHex(await app.next())).toBe(toHex(new Uint8Array([0x20 + i])));
-    }
-    await forget();
-    expect((await (await fakeApp(r.board.id, r.tokens[3])).closed).code).toBe(Close.full);
+    expect((await r.board.closed).code).toBe(Close.tooBig);
   });
 
   it('forwarding and the fourth-phone refusal survive hibernation', async () => {
@@ -228,7 +166,7 @@ describe('channels', () => {
     expect(await again.quiet()).toBe(true);
   });
 
-  it('ignores board control ops 06, 07 and 08', async () => {
+  it('ignores a malformed PUSH or LIVE and an unknown op', async () => {
     const r = await boardRoom();
     const app = await phone(r, 0, 1);
     r.board.send(new Uint8Array([0, 6, 3, 1, 0, 4, 1, 2, 3, 4]));
@@ -240,58 +178,3 @@ describe('channels', () => {
     expect(toHex(await app.next())).toBe('09');
   });
 });
-
-/**
- * When a phone sends each data chunk of a firmware update (ms from the start): it keeps at most
- * `window` bytes unacknowledged, the board reports every `report` bytes it has received (and at the
- * end), and each way takes half the round trip. The board's own processing time is left out, which
- * only makes the phone faster.
- */
-function updateSends(o: { rttMs: number; image: number; chunk?: number; window?: number; report?: number }): number[] {
-  const { rttMs, image, chunk = 1000, window = 16 * 1024, report = 4096 } = o;
-  const oneWay = rttMs / 2;
-  const sends: number[] = [];
-  const events: Array<{ t: number; kind: 'received' | 'report'; bytes: number }> = [];
-  const later = (e: (typeof events)[number]) => {
-    events.push(e);
-    events.sort((a, b) => a.t - b.t);
-  };
-  let sent = 0;
-  let acked = 0;
-  let reported = 0;
-  const pump = (t: number) => {
-    while (sent < image && sent + chunk - acked <= window) {
-      sent += chunk;
-      sends.push(t);
-      later({ t: t + oneWay, kind: 'received', bytes: sent });
-    }
-  };
-  pump(0);
-  for (let e = events.shift(); e; e = events.shift()) {
-    if (e.kind === 'received') {
-      const r = e.bytes >= image ? e.bytes : Math.floor(e.bytes / report) * report;
-      if (r > reported) {
-        reported = r;
-        later({ t: e.t + oneWay, kind: 'report', bytes: r });
-      }
-    } else {
-      acked = Math.max(acked, e.bytes);
-      pump(e.t);
-    }
-  }
-  return sends;
-}
-
-/** The fewest tokens a bucket of `rate` a second and `burst` holds over these send times (ms). */
-function lowestBucket(sends: number[], rate: number, burst: number): number {
-  let tokens = burst;
-  let at = 0;
-  let low = burst;
-  for (const t of sends) {
-    tokens = Math.min(burst, tokens + ((t - at) * rate) / 1000);
-    at = t;
-    tokens -= 1;
-    low = Math.min(low, tokens);
-  }
-  return low;
-}

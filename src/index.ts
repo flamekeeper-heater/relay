@@ -1,6 +1,6 @@
 // The relay's stateless front: checks the path and TLS, counts connects per client address, checks
 // the subprotocol, then hands the WebSocket upgrade to the board's Durable Object (one per board id).
-// A phone's push registration call (`/v1/app/<id>/push`, plain HTTP) goes to the same object.
+// A phone's push registration calls (`/v1/app/<id>/push…`, plain HTTP) go to the same object.
 
 import { BoardRoom } from './boardRoom';
 import { PushSender } from './push/pushSender';
@@ -12,6 +12,8 @@ export interface Env {
   PUSH: DurableObjectNamespace<PushSender>;
   BOARD_CONNECTS: RateLimit;
   APP_CONNECTS: RateLimit;
+  /** PUSH messages per board id. */
+  PUSH_RATE: RateLimit;
   /** The app's bundle id, the APNs topic. */
   BUNDLE_ID: string;
   /** "1" once Apple grants the Critical Alerts entitlement: class 3 then goes out critical. */
@@ -27,7 +29,7 @@ export function pushAvailable(env: Env): boolean {
   return !!(env.APNS_KEY_P8 && env.APNS_KEY_ID && env.APNS_TEAM_ID);
 }
 
-export function offersSubprotocol(request: Request): boolean {
+function offersSubprotocol(request: Request): boolean {
   const offered = request.headers.get('Sec-WebSocket-Protocol') ?? '';
   return offered.split(',').some((p) => p.trim() === SUBPROTOCOL);
 }
@@ -55,14 +57,14 @@ export async function handle(request: Request, env: Env): Promise<Response> {
   const limiter = path.role === 'board' ? env.BOARD_CONNECTS : env.APP_CONNECTS;
   const { success } = await limiter.limit({ key: limitKey(request.headers.get('CF-Connecting-IP') ?? '') });
   if (!success) return new Response('Too many connects', { status: 429 });
-  if (path.role === 'push') {
-    if (!pushAvailable(env)) return new Response('push not available', { status: 503 });
-    return env.BOARD.getByName(path.id).fetch(request);
+  if (path.role === 'board' || path.role === 'app') {
+    if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+      return new Response('WebSocket only', { status: 426, headers: { Upgrade: 'websocket' } });
+    }
+    if (!offersSubprotocol(request)) return new Response(`Subprotocol ${SUBPROTOCOL} required`, { status: 400 });
+  } else if (!pushAvailable(env)) {
+    return new Response('push not available', { status: 501 });
   }
-  if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
-    return new Response('WebSocket only', { status: 426, headers: { Upgrade: 'websocket' } });
-  }
-  if (!offersSubprotocol(request)) return new Response(`Subprotocol ${SUBPROTOCOL} required`, { status: 400 });
   return env.BOARD.getByName(path.id).fetch(request);
 }
 

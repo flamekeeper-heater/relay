@@ -14,12 +14,15 @@ describe('routing', () => {
     for (const path of [
       '/',
       '/v1/board/NGF6UY64ISRUIZR76FBJV2QQQQ',
-      '/v1/board/ngf6uy64isruizr76fbjv2qqqr',
       '/v1/board/short',
       `/v2/board/${ID}`,
       `/v1/phone/${ID}`,
       `/v1/board/${ID}/x`,
       `/v1/app/${ID}/`,
+      `/v1/board/${ID}/push`,
+      `/v1/app/${ID}/pushx`,
+      `/v1/app/${ID}/push/activity`,
+      `/v1/app/${ID}/push/activity/end/`,
     ]) {
       const r = await get(path);
       expect(r.status, path).toBe(404);

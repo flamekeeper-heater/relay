@@ -3,9 +3,11 @@
 // token) or, when the phone has no card, a push-to-start (its start token). The relay keeps each
 // phone's last blob, so it can say "lost contact" and renew a card at 8 hours on its own.
 
-import type { Live } from '../wire';
-import { iosMajor, type ApnsEnv } from './registry';
-import type { ApnsItem, ApnsPayload } from './types';
+import { base64 } from '../bytes';
+import { LIVE_EVENT_NAMES, type Live, LiveEvent } from '../wire';
+import { TITLE } from './apnsMessage';
+import { iosMajor } from './registry';
+import type { ApnsItem, ApnsPayload, Registration, Send } from './types';
 
 /** A card is renewed on the first update after 7 h 45 min (iOS ends a Live Activity at 8 h). */
 export const RENEW_AFTER_S = 27_900;
@@ -13,181 +15,113 @@ export const RENEW_AFTER_S = 27_900;
 export const LOST_UPDATE_S = 600;
 /** ... and this long: the cards end, kept on the Lock Screen for `LOST_DISMISSAL_S`. */
 export const LOST_END_S = 3600;
-export const LOST_DISMISSAL_S = 900;
-/** At most one LIVE per this from a board; an end always passes. */
-export const LIVE_INTERVAL_MS = 5_000;
-/** A board in a run sends a LIVE at least every 120 s: none for this long and it is taken as gone. */
-export const LIVE_SILENT_MS = 300_000;
+const LOST_DISMISSAL_S = 900;
 /** How long APNs keeps an end for a phone that is off; starts and updates keep until they would be stale. */
 const END_EXPIRY_S = 8 * 3600;
 /** The stale time when the board gives none. */
 const DEFAULT_STALE_S = 360;
 const IOS_INPUT_PUSH_TOKEN = 18;
-/** The card's ActivityKit attributes type, and the app's localized "Your heater started". */
+/** The card's ActivityKit attributes type, and the app's localized texts for a new and a renewed card. */
 const ATTRIBUTES_TYPE = 'HeaterActivityAttributes';
 const STARTED_KEY = 'card.started';
-const TITLE = 'Flamekeeper';
-const EVENT_NAME = ['start', 'update', 'end'] as const;
+const RENEWED_KEY = 'card.renewed';
 
-/** A slot's live card tokens and what the relay remembers of its card. */
-export type LiveRow = {
-  slot: number;
-  env: ApnsEnv;
-  start_token: string | null;
-  activity_token: string | null;
-  /** When the card behind `activity_token` started, UTC seconds. */
-  activity_started: number | null;
-  ios: string | null;
-  /** The run in which the phone swiped its card away (no push-to-start until the next run). */
-  dismissed_run: number | null;
-  /** The run in which the relay sent this phone a push-to-start (none again in that run). */
-  started_run: number | null;
-  /** The run in which this phone's card was lost (APNs refused its token): it may be push-started. */
-  lost_run: number | null;
-  /** The last blob the board sealed for this phone, and its LIVE event. */
-  live_blob: ArrayBuffer | null;
-  live_event: number | null;
-};
-
-/**
- * One APNs request for a slot. `token` says which token it used (a `gone` answer forgets that one);
- * `after` what to record once it is sent: the card is over (`forgetCard`), or a push-to-start went
- * out in this run (`started`).
- */
-export interface LiveSend {
-  slot: number;
-  token: 'start' | 'activity';
-  item: ApnsItem;
-  after?: 'forgetCard' | 'started';
-}
-
-export interface LiveContext {
-  relayId: string;
-  nowS: number;
-  /** The current run's id (the relay's time of its start). */
-  run: number;
-}
+type RelayNote = { lostAt: number } | { renewed: true };
 
 /** What the card's content state holds when it comes from the relay (`LiveContent` in the app). */
-export function contentState(blob: Uint8Array | null, event: number, card: number | null, relay?: { lostAt?: number; renewed?: boolean }): ApnsPayload {
-  const c: ApnsPayload = { v: 1 };
-  if (blob) {
-    c.sealed = base64(blob);
-    c.e = event;
-  }
-  if (card !== null) c.card = card;
-  c.via = 'internet';
-  if (relay) c.relay = relay;
-  return c;
+function contentState(blob: Uint8Array | null, event: number, card: number | null, relay?: RelayNote): ApnsPayload {
+  return {
+    v: 1,
+    ...(blob ? { sealed: base64(blob), e: event } : {}),
+    ...(card === null ? {} : { card }),
+    via: 'internet',
+    ...(relay ? { relay } : {}),
+  };
 }
 
 /** The requests for one LIVE: per slot the board sealed a record for and that has a registration. */
-export function liveRequests(l: Live, rows: LiveRow[], o: LiveContext): LiveSend[] {
-  const out: LiveSend[] = [];
-  const byslot = new Map(rows.map((r) => [r.slot, r]));
+export function liveRequests(l: Live, rows: Registration[], boardId: string, nowS: number): Send[] {
+  const out: Send[] = [];
+  const bySlot = new Map(rows.map((r) => [r.slot, r]));
   const staleS = l.staleS || DEFAULT_STALE_S;
-  const priority: 5 | 10 = l.important || l.event !== 1 ? 10 : 5;
+  const priority = l.important || l.event !== LiveEvent.update ? 10 : 5;
   for (const [slot, blob] of l.blobs) {
-    const r = byslot.get(slot);
+    const r = bySlot.get(slot);
     if (!r) continue;
-    const card = r.activity_token;
-    if (l.event === 2) {
-      if (card) {
-        out.push({
-          slot,
-          token: 'activity',
-          item: endItem(r, card, contentState(blob, l.event, r.activity_started), o.nowS, l.dismissalS),
-          after: 'forgetCard',
-        });
-      }
-      continue;
-    }
-    const renew = card !== null && r.start_token !== null && r.activity_started !== null && o.nowS >= r.activity_started + RENEW_AFTER_S;
-    if (card && !renew) {
-      out.push({ slot, token: 'activity', item: updateItem(r, card, contentState(blob, l.event, r.activity_started), o.nowS, staleS, priority) });
-      continue;
-    }
-    if (renew) {
-      // The new card first, so the phone never shows none; then the old one goes at once.
-      out.push({ slot, token: 'start', item: startItem(r, blob, l.event, o, staleS, { renewed: true }), after: 'started' });
-      out.push({ slot, token: 'activity', item: endItem(r, card!, contentState(blob, l.event, r.activity_started), o.nowS, 0), after: 'forgetCard' });
-      continue;
-    }
-    // No card: start one, unless this phone started the run (its app made its own card, unless that
-    // card was lost since), swiped the card away in this run, or was already sent a start in this run.
-    const ownCard = slot === l.starter && r.lost_run !== o.run;
-    if (r.start_token && !ownCard && r.dismissed_run !== o.run && r.started_run !== o.run) {
-      out.push({ slot, token: 'start', item: startItem(r, blob, l.event, o, staleS), after: 'started' });
+    const content = contentState(blob, l.event, r.activity_started);
+    const start = (relay?: { renewed: true }): Send => ({
+      slot,
+      kind: 'start',
+      event: 'start',
+      item: startItem(r, contentState(blob, l.event, nowS, relay), boardId, nowS, staleS),
+      after: 'started',
+      run: l.run,
+    });
+    if (l.event === LiveEvent.end) {
+      if (r.activity_token) out.push(end(r, content, nowS, l.dismissalS));
+    } else if (!r.activity_token) {
+      // No card: start one, unless this phone started the run (its app made its own card), or was
+      // already sent a start or swiped its card away in this run.
+      if (r.start_token && slot !== l.starter && r.no_start_run !== l.run) out.push(start());
+    } else if (r.start_token && r.activity_started !== null && nowS >= r.activity_started + RENEW_AFTER_S) {
+      // A renewal: the new card, and once APNs took it the old one goes at once.
+      out.push({ ...start({ renewed: true }), next: end(r, content, nowS, 0) });
+    } else {
+      out.push({ slot, kind: 'activity', event: 'update', item: updateItem(r, content, nowS, staleS, priority) });
     }
   }
   return out;
 }
 
 /**
- * The board has been away: per slot with a card, an update saying so (`end` false) or the card's
- * end (`end` true), with the last record the board sealed for that phone.
+ * The board has been away since `lostAt`: per slot with a card, an update saying so, or (`ended`)
+ * the card's end, with the last record the board sealed for that phone.
  */
-export function lostContactRequests(rows: LiveRow[], lostAt: number, nowS: number, end: boolean): LiveSend[] {
-  const out: LiveSend[] = [];
-  for (const r of rows) {
-    if (!r.activity_token) continue;
-    const blob = r.live_blob ? new Uint8Array(r.live_blob) : null;
-    const content = contentState(blob, r.live_event ?? 1, r.activity_started, { lostAt });
-    out.push(
-      end
-        ? { slot: r.slot, token: 'activity', item: endItem(r, r.activity_token, content, nowS, LOST_DISMISSAL_S), after: 'forgetCard' }
-        : { slot: r.slot, token: 'activity', item: updateItem(r, r.activity_token, content, nowS, 0, 10) },
-    );
-  }
-  return out;
+export function lostContactRequests(rows: Registration[], lostAt: number, nowS: number, ended: boolean): Send[] {
+  return rows
+    .filter((r) => r.activity_token)
+    .map((r) => {
+      const content = contentState(lastBlob(r), r.live_event ?? LiveEvent.update, r.activity_started, { lostAt });
+      return ended
+        ? end(r, content, nowS, LOST_DISMISSAL_S)
+        : { slot: r.slot, kind: 'activity', event: 'update', item: updateItem(r, content, nowS, 0, 10) };
+    });
 }
 
 /** The end for a card whose token came after its run ended: kept until the run's own dismissal. */
-export function lateEndRequest(r: LiveRow, nowS: number, untilS: number): LiveSend {
-  const blob = r.live_blob ? new Uint8Array(r.live_blob) : null;
-  const content = contentState(blob, r.live_event ?? 2, r.activity_started);
-  return { slot: r.slot, token: 'activity', item: endItem(r, r.activity_token!, content, nowS, Math.max(0, untilS - nowS)), after: 'forgetCard' };
+export function lateEndRequest(r: Registration, nowS: number, untilS: number): Send {
+  return end(r, contentState(lastBlob(r), r.live_event ?? LiveEvent.end, r.activity_started), nowS, Math.max(0, untilS - nowS));
 }
 
-function updateItem(r: LiveRow, token: string, content: ApnsPayload, nowS: number, staleS: number, priority: 5 | 10): ApnsItem {
-  return item(r, token, priority, nowS + Math.max(staleS, 60), {
+function lastBlob(r: Registration): Uint8Array | null {
+  return r.live_blob ? new Uint8Array(r.live_blob) : null;
+}
+
+function end(r: Registration, content: ApnsPayload, nowS: number, dismissalS: number): Send {
+  const aps = { timestamp: nowS, event: LIVE_EVENT_NAMES[LiveEvent.end], 'content-state': content, 'dismissal-date': nowS + dismissalS };
+  return { slot: r.slot, kind: 'activity', event: 'end', item: item(r, r.activity_token!, 10, nowS + END_EXPIRY_S, aps), after: 'forgetCard' };
+}
+
+function updateItem(r: Registration, content: ApnsPayload, nowS: number, staleS: number, priority: 5 | 10): ApnsItem {
+  const aps = { timestamp: nowS, event: LIVE_EVENT_NAMES[LiveEvent.update], 'content-state': content, 'stale-date': nowS + staleS };
+  return item(r, r.activity_token!, priority, nowS + Math.max(staleS, 60), aps);
+}
+
+function startItem(r: Registration, content: ApnsPayload, boardId: string, nowS: number, staleS: number): ApnsItem {
+  const aps: ApnsPayload = {
     timestamp: nowS,
-    event: EVENT_NAME[1],
+    event: LIVE_EVENT_NAMES[LiveEvent.start],
     'content-state': content,
     'stale-date': nowS + staleS,
-  });
-}
-
-function endItem(r: LiveRow, token: string, content: ApnsPayload, nowS: number, dismissalS: number): ApnsItem {
-  return item(r, token, 10, nowS + END_EXPIRY_S, {
-    timestamp: nowS,
-    event: EVENT_NAME[2],
-    'content-state': content,
-    'dismissal-date': nowS + dismissalS,
-  });
-}
-
-function startItem(r: LiveRow, blob: Uint8Array, event: number, o: LiveContext, staleS: number, relay?: { renewed: true }): ApnsItem {
-  const aps: ApnsPayload = {
-    timestamp: o.nowS,
-    event: EVENT_NAME[0],
-    'content-state': contentState(blob, event, o.nowS, relay),
-    'stale-date': o.nowS + staleS,
     'attributes-type': ATTRIBUTES_TYPE,
-    attributes: { board: o.relayId },
-    alert: { title: TITLE, body: { 'loc-key': STARTED_KEY } },
+    attributes: { board: boardId },
+    alert: { title: TITLE, body: { 'loc-key': content.relay ? RENEWED_KEY : STARTED_KEY } },
   };
   // iOS 18 sends the new card's update token back to the app at once.
   if (iosMajor(r.ios) >= IOS_INPUT_PUSH_TOKEN) aps['input-push-token'] = 1;
-  return item(r, r.start_token!, 10, o.nowS + Math.max(staleS, 60), aps);
+  return item(r, r.start_token!, 10, nowS + Math.max(staleS, 60), aps);
 }
 
-function item(r: LiveRow, token: string, priority: 5 | 10, expiration: number, aps: ApnsPayload): ApnsItem {
-  return { env: r.env, device: token, pushType: 'liveactivity', priority, expiration, payload: { aps } };
-}
-
-function base64(b: Uint8Array): string {
-  let s = '';
-  for (const x of b) s += String.fromCharCode(x);
-  return btoa(s);
+function item(r: Registration, token: string, priority: 5 | 10, expiration: number, aps: ApnsPayload): ApnsItem {
+  return { env: r.env, token, pushType: 'liveactivity', priority, expiration, payload: { aps } };
 }

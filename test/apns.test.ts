@@ -1,16 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { FALLBACK_HOLD_S, ProviderToken, TOKEN_MIN_S, TOKEN_REUSE_S, TOKEN_VALID_S, apnsJwt, apnsRequest, importApnsKey } from '../src/push/apns';
+import { apnsJwt, importApnsKey } from '../src/push/apns';
+import { testKey } from './fakes';
 
 const NOW = 1_900_000_000;
-
-/** A fresh P-256 key, its private half as a .p8 file's contents (PKCS#8 PEM). */
-export async function testKey(): Promise<{ pem: string; publicKey: CryptoKey }> {
-  const pair = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])) as CryptoKeyPair;
-  const der = new Uint8Array((await crypto.subtle.exportKey('pkcs8', pair.privateKey)) as ArrayBuffer);
-  const b64 = btoa(String.fromCharCode(...der));
-  const lines = b64.match(/.{1,64}/g)!.join('\n');
-  return { pem: `-----BEGIN PRIVATE KEY-----\n${lines}\n-----END PRIVATE KEY-----\n`, publicKey: pair.publicKey };
-}
 
 function part(jwt: string, i: number): Uint8Array {
   const s = jwt.split('.')[i].replace(/-/g, '+').replace(/_/g, '/');
@@ -39,74 +31,5 @@ describe('provider token', () => {
   it('reads a key without line breaks too', async () => {
     const { pem } = await testKey();
     await expect(importApnsKey(pem.replace(/\n/g, ''))).resolves.toBeDefined();
-    await expect(importApnsKey('test-key')).rejects.toBeDefined();
-  });
-
-  it('is the same token until 40 minutes, then a new one', async () => {
-    const t = new ProviderToken(importApnsKey((await testKey()).pem), 'K', 'T');
-    const a = await t.get(NOW);
-    expect(await t.get(NOW + TOKEN_REUSE_S - 1)).toBe(a);
-    const b = await t.get(NOW + TOKEN_REUSE_S);
-    expect(b).not.toBe(a);
-    expect(json(b, 1)).toEqual({ iss: 'T', iat: NOW + TOKEN_REUSE_S });
-  });
-
-  it('is renewed when APNs calls it expired, but never sooner than 20 minutes', async () => {
-    const t = new ProviderToken(importApnsKey((await testKey()).pem), 'K', 'T');
-    const a = await t.get(NOW);
-    t.expire(NOW + TOKEN_MIN_S - 1);
-    expect(await t.get(NOW + TOKEN_MIN_S - 1)).toBe(a);
-    t.expire(NOW + TOKEN_MIN_S);
-    expect(await t.get(NOW + TOKEN_MIN_S)).not.toBe(a);
-  });
-
-  it('a new token APNs calls too soon goes back to the one before for 5 minutes, while it is valid', async () => {
-    const t = new ProviderToken(importApnsKey((await testKey()).pem), 'K', 'T');
-    const a = await t.get(NOW);
-    const r = NOW + TOKEN_REUSE_S;
-    const b = await t.get(r);
-    expect(t.fallBack(r)).toBe(true);
-    expect(await t.get(r)).toBe(a);
-    expect(await t.get(r + FALLBACK_HOLD_S - 1)).toBe(a);
-    expect(t.fallBack(r)).toBe(false);
-    const c = await t.get(r + FALLBACK_HOLD_S);
-    expect(c).not.toBe(a);
-    expect(c).not.toBe(b);
-    expect(json(c, 1)).toEqual({ iss: 'T', iat: r + FALLBACK_HOLD_S });
-    // Refused again: back to the first one, but never past its 55 minutes.
-    expect(t.fallBack(NOW + TOKEN_VALID_S - 60)).toBe(true);
-    expect(await t.get(NOW + TOKEN_VALID_S - 1)).toBe(a);
-    expect(await t.get(NOW + TOKEN_VALID_S)).not.toBe(a);
-    expect(t.fallBack(NOW + TOKEN_VALID_S)).toBe(false);
-  });
-
-  it('has nothing to go back to when the only token is refused', async () => {
-    const t = new ProviderToken(importApnsKey((await testKey()).pem), 'K', 'T');
-    const a = await t.get(NOW);
-    expect(t.fallBack(NOW)).toBe(false);
-    expect(await t.get(NOW)).toBe(a);
-  });
-});
-
-describe('APNs request', () => {
-  const base = { deviceToken: 'ab'.repeat(32), bundleId: 'app.example.Heater', priority: 10 as const, expiration: NOW + 60, payload: { aps: {} }, jwt: 'h.c.s' };
-
-  it('goes to the sandbox host for sandbox and the production host for production', () => {
-    expect(apnsRequest({ ...base, env: 'sandbox', pushType: 'alert' }).url).toBe(`https://api.sandbox.push.apple.com/3/device/${'ab'.repeat(32)}`);
-    expect(apnsRequest({ ...base, env: 'production', pushType: 'alert' }).url).toBe(`https://api.push.apple.com/3/device/${'ab'.repeat(32)}`);
-  });
-
-  it('carries the token, push type, priority, expiration and topic', async () => {
-    const r = apnsRequest({ ...base, env: 'sandbox', pushType: 'alert', priority: 5 });
-    expect(r.method).toBe('POST');
-    expect(r.headers.get('authorization')).toBe('bearer h.c.s');
-    expect(r.headers.get('apns-push-type')).toBe('alert');
-    expect(r.headers.get('apns-priority')).toBe('5');
-    expect(r.headers.get('apns-expiration')).toBe(String(NOW + 60));
-    expect(r.headers.get('apns-topic')).toBe('app.example.Heater');
-    expect(await r.json()).toEqual({ aps: {} });
-    const live = apnsRequest({ ...base, env: 'sandbox', pushType: 'liveactivity' });
-    expect(live.headers.get('apns-push-type')).toBe('liveactivity');
-    expect(live.headers.get('apns-topic')).toBe('app.example.Heater.push-type.liveactivity');
   });
 });

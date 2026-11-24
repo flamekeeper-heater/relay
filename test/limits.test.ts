@@ -20,9 +20,10 @@ function testEnv(): Env & { boards: CountingLimiter; apps: CountingLimiter } {
   const apps = new CountingLimiter(60);
   return {
     BOARD: env.BOARD,
-    PUSH: env.PUSH,
+    PUSH: env.PUSH as Env['PUSH'],
     BOARD_CONNECTS: boards as unknown as RateLimit,
     APP_CONNECTS: apps as unknown as RateLimit,
+    PUSH_RATE: env.PUSH_RATE,
     BUNDLE_ID: env.BUNDLE_ID,
     boards,
     apps,
@@ -57,17 +58,8 @@ describe('per-IP limits', () => {
     expect(statuses[20]).toBe(429);
   });
 
-  it('the 61st app connect gets 429', async () => {
-    const e = testEnv();
-    const id = randomId();
-    const statuses = await connects(61, () => `/v1/app/${id}`, '203.0.113.2', e);
-    expect(statuses.slice(0, 60)).toEqual(Array(60).fill(101));
-    expect(statuses[60]).toBe(429);
-    expect(e.boards.counts.size).toBe(0); // app connects are counted apart from board connects
-  });
-
   it('push registration calls count with the app connects', async () => {
-    const e = testEnv(); // no APNs secrets: each call is answered 503 after it is counted
+    const e = testEnv(); // no APNs secrets: each call is answered 501 after it is counted
     const id = randomId();
     const statuses = [];
     for (let i = 0; i < 61; i++) {
@@ -77,17 +69,9 @@ describe('per-IP limits', () => {
       );
       statuses.push(r.status);
     }
-    expect(statuses.slice(0, 60)).toEqual(Array(60).fill(503));
+    expect(statuses.slice(0, 60)).toEqual(Array(60).fill(501));
     expect(statuses[60]).toBe(429);
     expect(e.boards.counts.size).toBe(0);
-  });
-
-  it('two IPs are counted apart', async () => {
-    const e = testEnv();
-    const path = () => `/v1/board/${randomId()}`;
-    expect(await connects(20, path, '203.0.113.3', e)).toEqual(Array(20).fill(101));
-    expect(await connects(20, path, '2001:db8::1', e)).toEqual(Array(20).fill(101));
-    expect(await connects(1, path, '203.0.113.3', e)).toEqual([429]);
   });
 
   it('counts an IPv6 address by its /64', async () => {

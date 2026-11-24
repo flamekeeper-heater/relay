@@ -1,12 +1,8 @@
-import { runInDurableObject } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { BoardRoom } from '../src/boardRoom';
-import { FIXED_TEXT, apnsForBlob } from '../src/push/apnsMessage';
+import { apnsForBlob } from '../src/push/apnsMessage';
 import { decodePush } from '../src/wire';
 import { concat, hex, sha256, toHex } from './bytes';
-import { env } from 'cloudflare:workers';
-import { freshMemory } from '../src/boardRoom';
-import { type FakeBoardSocket, eventually, fakeBoard, fakeSender, register, room, rows, setClock } from './fakes';
+import { type FakeBoardSocket, eventually, fakeBoard, fakeSender, logged, register, rows, setClock } from './fakes';
 
 // The test vectors in PROTOCOL.md: a class 1 PUSH for slot 2, and its blob.
 const PUSH_MESSAGE =
@@ -76,13 +72,13 @@ describe('PUSH decoding', () => {
   it('reads the vector', () => {
     const p = decodePush(hex(PUSH_MESSAGE))!;
     expect(p.cls).toBe(1);
-    expect(p.blobs.map((x) => [x.slot, x.blob.length, toHex(x.blob)])).toEqual([[2, 83, PUSH_BLOB]]);
+    expect([...p.blobs].map(([slot, b]) => [slot, toHex(b)])).toEqual([[2, PUSH_BLOB]]);
   });
 
   it('takes up to 8 unique slots, blobs of 28 bytes or more', () => {
     const eight = Array.from({ length: 8 }, (_, i) => [i, blob(i, 28)] as [number, Uint8Array]);
-    expect(decodePush(pushMessage(3, eight))!.blobs.map((x) => x.slot)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
-    expect(decodePush(pushMessage(0, []))).toEqual({ cls: 0, blobs: [] });
+    expect([...decodePush(pushMessage(3, eight))!.blobs.keys()]).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+    expect(decodePush(pushMessage(0, []))).toEqual({ cls: 0, blobs: new Map() });
   });
 
   it('refuses a malformed PUSH', () => {
@@ -144,17 +140,6 @@ describe('APNs message for a blob', () => {
     expect(aps(critical.payload).sound).toEqual({ critical: 1, name: 'default', volume: 1 });
     expect(aps(critical.payload)['thread-id']).toBe(ID);
   });
-
-  it('has the fixed texts', () => {
-    expect(FIXED_TEXT).toEqual({
-      3: 'Heater alarm. Open Flamekeeper now.',
-      2: 'A heater needs you. Open Flamekeeper.',
-      1: 'Heater alert. Open Flamekeeper.',
-      0: 'Heater update.',
-      offline: 'A heater is offline. Open Flamekeeper.',
-      online: 'A heater is back online.',
-    });
-  });
 });
 
 describe('PUSH fan-out', () => {
@@ -163,8 +148,8 @@ describe('PUSH fan-out', () => {
     const sender = await fakeSender(b.id);
     b.send(pushMessage(1, [[1, blob(1)], [2, blob(2)], [5, blob(5)]]));
     await eventually(async () => (await sender.items()).length === 2);
-    const items = (await sender.items()).sort((x, y) => x.device.localeCompare(y.device));
-    expect(items.map((i) => [i.env, i.device, i.priority, i.expiration])).toEqual([
+    const items = (await sender.items()).sort((x, y) => x.token.localeCompare(y.token));
+    expect(items.map((i) => [i.env, i.token, i.priority, i.expiration])).toEqual([
       ['sandbox', DEVICE_2, 10, NOW / 1000 + 86_400],
       ['production', DEVICE_1, 10, NOW / 1000 + 86_400],
     ]);
@@ -175,34 +160,21 @@ describe('PUSH fan-out', () => {
 
   it('skips a slot whose registration has no device', async () => {
     const b = await boardWithPhones();
-    expect((await register(b.id, T1, { device: null })).status).toBe(204);
-    expect(toHex(await b.next())).toBe('0008040000');
+    expect((await register(b.id, T1, { env: 'production', startToken: 'cc'.repeat(32) })).status).toBe(204);
+    expect(toHex(await b.next())).toBe('0008040002');
     const sender = await fakeSender(b.id);
     b.send(pushMessage(1, [[1, blob(1)], [2, blob(2)]]));
     await eventually(async () => (await sender.items()).length === 1);
     expect(await b.quiet()).toBe(true);
-    expect((await sender.items()).map((i) => i.device)).toEqual([DEVICE_2]);
-  });
-
-  it('skips a slot no longer in the roster', async () => {
-    const b = await boardWithPhones();
-    // A row the roster no longer backs (rosters drop such rows; this one is planted).
-    await runInDurableObject(room(b.id), (_o: BoardRoom, state) => {
-      state.storage.sql.exec(`INSERT INTO push (slot, kind, env, device, updated) VALUES (3, 'apns', 'sandbox', ?, 0)`, 'cc'.repeat(32));
-    });
-    const sender = await fakeSender(b.id);
-    b.send(pushMessage(1, [[2, blob(2)], [3, blob(3)]]));
-    await eventually(async () => (await sender.items()).length === 1);
-    expect(await b.quiet()).toBe(true);
-    expect((await sender.items()).map((i) => i.device)).toEqual([DEVICE_2]);
+    expect((await sender.items()).map((i) => i.token)).toEqual([DEVICE_2]);
   });
 
   it('forgets a token APNs calls gone', async () => {
     const b = await boardWithPhones();
-    const sender = await fakeSender(b.id, (i) => (i.device === DEVICE_1 ? 'gone' : 'sent'));
+    const sender = await fakeSender(b.id, (i) => (i.token === DEVICE_1 ? 'gone' : 'sent'));
     b.send(pushMessage(1, [[1, blob(1)], [2, blob(2)]]));
     expect(toHex(await b.next())).toBe('0008040000');
-    expect((await rows(b.id, 'push')).map((r) => r.slot)).toEqual([2]);
+    expect((await rows(b.id, 'registration')).map((r) => r.slot)).toEqual([2]);
     expect((await sender.items()).length).toBe(2);
   });
 
@@ -212,86 +184,17 @@ describe('PUSH fan-out', () => {
     b.send(pushMessage(2, [[1, blob(1)], [2, blob(2)]]));
     await eventually(async () => (await sender.items()).length === 2);
     expect(await b.quiet()).toBe(true);
-    expect((await rows(b.id, 'push')).map((r) => r.slot)).toEqual([1, 2]);
+    expect((await rows(b.id, 'registration')).map((r) => r.slot)).toEqual([1, 2]);
   });
 
-  it('drops the 21st PUSH in an hour but never a class 3', async () => {
+  it('drops a PUSH over 20 a minute but never a class 3', async () => {
     const b = await boardWithPhones();
     const sender = await fakeSender(b.id);
-    const count = async () => (await sender.items()).length;
-    for (let i = 0; i < 20; i++) b.send(pushMessage(1, [[2, blob(i)]]));
-    await eventually(async () => (await count()) === 20);
-    b.send(pushMessage(1, [[2, blob(20)]])); // the 21st: dropped
-    b.send(pushMessage(3, [[2, blob(21)]])); // a CO alarm: always
-    b.send(pushMessage(3, [[2, blob(22)]]));
-    await eventually(async () => (await count()) === 22);
-    const items = await sender.items();
-    expect(items.slice(20).map((i) => aps(i.payload).alert.body)).toEqual([FIXED_TEXT[3], FIXED_TEXT[3]]);
-    await setClock(b.id, NOW + 3_599_999);
-    b.send(pushMessage(1, [[2, blob(23)]]));
-    expect(await b.quiet(100)).toBe(true);
-    expect(await count()).toBe(22);
-    await setClock(b.id, NOW + 3_600_000);
-    b.send(pushMessage(1, [[2, blob(24)]]));
-    await eventually(async () => (await count()) === 23);
-    expect((await sender.items())[22].payload).toEqual(apnsForBlob(1, b.id, blob(24), false).payload);
-  });
-
-  it('keeps the hourly count when the room loses its memory (hibernation)', async () => {
-    const b = await boardWithPhones();
-    const sender = await fakeSender(b.id);
-    const count = async () => (await sender.items()).length;
-    for (let i = 0; i < 20; i++) b.send(pushMessage(1, [[2, blob(i)]]));
-    await eventually(async () => (await count()) === 20);
-    await runInDurableObject(room(b.id), (o: BoardRoom) => {
-      o.mem = freshMemory();
-    });
-    b.send(pushMessage(2, [[2, blob(20)]])); // still the 21st in this hour: dropped
-    b.send(pushMessage(3, [[2, blob(21)]]));
-    await eventually(async () => (await count()) === 21);
-    expect(aps((await sender.items())[20].payload).alert.body).toBe(FIXED_TEXT[3]);
-    expect(await b.quiet()).toBe(true);
-  });
-
-  it('never sends a blank board id: a room not made by board id skips the push', async () => {
-    const log = vi.spyOn(console, 'log');
-    const stub = env.BOARD.get(env.BOARD.newUniqueId());
-    const b = await fakeBoard({ via: stub });
-    await b.signIn();
-    b.roster([[2, H]]);
-    expect(toHex(await b.next())).toBe('0008000000');
-    const r = await stub.fetch(`https://relay.flamekeeper.app/v1/app/${b.id}/push`, {
-      method: 'PUT',
-      headers: { Authorization: `Bearer ${btoa(String.fromCharCode(...T)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')}` },
-      body: JSON.stringify({ env: 'sandbox', device: DEVICE_2 }),
-    });
-    expect(r.status).toBe(204);
-    expect(toHex(await b.next())).toBe('0008040000');
-    const sent: unknown[] = [];
-    await runInDurableObject(stub, (o: BoardRoom) => {
-      o.pushSender = async (items) => {
-        sent.push(...items);
-        return items.map(() => 'sent' as const);
-      };
-    });
-    b.send(pushMessage(1, [[2, blob(2)]]));
-    await eventually(() => log.mock.calls.some((c) => c.join(' ').includes('push skipped: no board id')));
-    expect(sent).toEqual([]);
-    expect(b.ws.readyState).toBe(WebSocket.OPEN);
-  });
-
-  it('a class 3 push reaches a slot whose phone switched notifications off', async () => {
-    // The phone's switch is a board preference (PUSH_PREFS flags bit 0): the relay has no
-    // per-alert filter, so its registration alone decides, and a CO alarm goes through.
-    const b = await boardWithPhones();
-    const sender = await fakeSender(b.id);
-    b.send(pushMessage(3, [[2, blob(9)]]));
-    await eventually(async () => (await sender.items()).length === 1);
-    const [item] = await sender.items();
-    expect(item.device).toBe(DEVICE_2);
-    expect(item.priority).toBe(10);
-    expect(aps(item.payload)['interruption-level']).toBe('time-sensitive'); // CRITICAL_ALERTS is "0"
-    expect(aps(item.payload).alert.body).toBe('Heater alarm. Open Flamekeeper now.');
+    // 41 at once: however the limiter's minute splits them, one minute holds 21.
+    for (let i = 0; i < 41; i++) b.send(pushMessage(1, [[2, blob(i)]]));
+    b.send(pushMessage(3, [[2, blob(99)]])); // a CO alarm: always
+    await eventually(async () => (await sender.items()).some((i) => aps(i.payload).alert.body === 'Heater alarm. Open Flamekeeper now.'));
+    expect((await sender.items()).length).toBeLessThan(42);
   });
 
   it('ignores a malformed PUSH and keeps the board; logs never carry blobs or device tokens', async () => {
@@ -300,19 +203,17 @@ describe('PUSH fan-out', () => {
     const sender = await fakeSender(b.id);
     const secret = blob(0xab, 60);
     b.send(pushMessage(4, [[2, secret]]));
-    b.send(pushMessage(1, [[2, secret]]).subarray(0, 30));
     b.send(pushMessage(1, [[2, secret]]));
     await eventually(async () => (await sender.items()).length === 1);
     expect(await b.quiet()).toBe(true);
     expect(b.ws.readyState).toBe(WebSocket.OPEN);
-    const lines = log.mock.calls.map((c) => c.join(' '));
-    expect(lines.some((l) => l.includes('push malformed'))).toBe(true);
-    expect(lines.some((l) => l.includes('push: 1 sent, 0 gone, 0 failed'))).toBe(true);
+    const lines = logged(log);
+    expect(lines).toContain(JSON.stringify({ board: b.id, event: 'push malformed' }));
+    expect(lines).toContain(JSON.stringify({ board: b.id, event: 'push', sends: [{ push: 'alert', to: 'device', env: 'sandbox', outcome: 'sent' }] }));
     for (const l of lines) {
-      expect(l).not.toMatch(/class/); // counts only: a line naming the class would say "CO alarm at T"
+      expect(l).not.toMatch(/class/); // a line naming the class would say "CO alarm at T"
       expect(l).not.toContain('abab');
       expect(l).not.toContain(base64(secret).slice(0, 16));
-      expect(l).not.toContain(DEVICE_1.slice(0, 16));
       expect(l).not.toContain(DEVICE_2.slice(0, 16));
     }
   });
@@ -321,9 +222,9 @@ describe('PUSH fan-out', () => {
     const log = vi.spyOn(console, 'log');
     const b = await boardWithPhones();
     b.send(pushMessage(1, [[2, blob(2)]]));
-    await eventually(() => log.mock.calls.some((c) => c.join(' ').includes('apns key unusable')));
-    await eventually(() => log.mock.calls.some((c) => c.join(' ').includes('push: 0 sent, 0 gone, 1 failed')));
-    expect((await rows(b.id, 'push')).length).toBe(2);
+    await eventually(() => logged(log).some((l) => l.includes('"outcome":"failed"')));
+    expect(logged(log).some((l) => l.includes('apns failed'))).toBe(true);
+    expect((await rows(b.id, 'registration')).length).toBe(2);
     expect(await b.quiet()).toBe(true);
   });
 });

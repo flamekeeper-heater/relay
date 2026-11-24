@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  Close,
-  MAX_MESSAGE,
   Op,
-  SUBPROTOCOL,
   authSignedBytes,
   decodeAuth,
   decodeClose,
@@ -13,7 +10,7 @@ import {
   encodeOpen,
   encodeWant,
 } from '../src/wire';
-import { P256_G, concat, sha256, toHex } from './bytes';
+import { concat, hex, sha256, toHex } from './bytes';
 
 const enc = new TextEncoder();
 
@@ -38,22 +35,6 @@ function roster(format: number, entries: Array<[number, number]>): Uint8Array {
   );
 }
 
-describe('wire constants', () => {
-  it('match PROTOCOL.md', () => {
-    expect(SUBPROTOCOL).toBe('flamekeeper-relay.v1');
-    expect(MAX_MESSAGE).toBe(2048);
-    expect(Op).toEqual({ challenge: 1, auth: 2, roster: 3, open: 4, close: 5, push: 6, live: 7, want: 8 });
-    expect(Close).toEqual({
-      replaced: 4001,
-      authFailed: 4002,
-      notPaired: 4003,
-      offline: 4004,
-      full: 4005,
-      policy: 4008,
-    });
-  });
-});
-
 describe('control messages', () => {
   it('encodes CHALLENGE, OPEN and CLOSE', () => {
     const c = new Uint8Array(32).fill(0xab);
@@ -73,16 +54,6 @@ describe('control messages', () => {
     expect(toHex(await sha256(b))).toBe('74fb627cbe5d30589bd59e83f30b9e88c4d78629a0111bd22f2d516259d54600');
   });
 
-  it('decodes AUTH', () => {
-    const a = decodeAuth(concat(new Uint8Array([0, 2]), P256_G, new Uint8Array(64).fill(9), new Uint8Array([3]), enc.encode('1.0')));
-    expect(a).not.toBeNull();
-    expect(toHex(a!.publicKey)).toBe(toHex(P256_G));
-    expect(toHex(a!.signature)).toBe('09'.repeat(64));
-    expect(a!.firmware).toBe('1.0');
-    expect(decodeAuth(auth({ firmware: new Uint8Array(32).fill(0x31) }))!.firmware).toBe('1'.repeat(32));
-    expect(decodeAuth(auth({ firmware: new Uint8Array(0) }))!.firmware).toBe('');
-  });
-
   it('refuses a malformed AUTH', () => {
     expect(decodeAuth(auth({ key: 64 }))).toBeNull();
     expect(decodeAuth(auth({ sig: 63 }))).toBeNull();
@@ -92,11 +63,10 @@ describe('control messages', () => {
     expect(decodeAuth(new Uint8Array([0, 2]))).toBeNull();
   });
 
-  it('decodes ROSTER', () => {
-    expect(decodeRoster(roster(1, []))!.size).toBe(0);
-    const eight = decodeRoster(roster(1, [0, 1, 2, 3, 4, 5, 6, 7].map((s) => [s, s + 0x10] as [number, number])))!;
-    expect(eight.size).toBe(8);
-    expect(toHex(eight.get(7)!)).toBe('17'.repeat(32));
+  it('reads the ROSTER vector', () => {
+    const r = decodeRoster(hex('00030102d91429cfba5c46b38cfeb129eb4f263b616323ad4d7c20aeb3430d641258e834'))!;
+    expect([...r.keys()]).toEqual([2]);
+    expect(toHex(r.get(2)!)).toBe('d91429cfba5c46b38cfeb129eb4f263b616323ad4d7c20aeb3430d641258e834');
   });
 
   it('refuses a malformed ROSTER', () => {

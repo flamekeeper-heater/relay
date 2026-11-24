@@ -47,8 +47,9 @@ npm run typecheck
 You need a Cloudflare account with a domain on it.
 
 1. In `wrangler.jsonc`, set `routes` to your own host (for example `relay.example.com`) and delete
-   the `test` environment, or point its route at a second host. If the `namespace_id`s of the
-   rate limits clash with another Worker in your account, change them.
+   the `test` environment, or point its route at a second host (its `PUSH` binding names the main
+   Worker by `script_name`: rename that too, deploy the main one first). If the `namespace_id`s of
+   the rate limits clash with another Worker in your account, change them.
 2. Deploy:
 
    ```bash
@@ -62,7 +63,7 @@ You need a Cloudflare account with a domain on it.
 That gives remote control. **Push notifications are optional:** they need an Apple developer
 account and the app's bundle id (`BUNDLE_ID` in `wrangler.jsonc`), so the official app's
 notifications only work through the official relay. Without the three APNs secrets the relay
-answers push registrations with 503 `push not available`, and the app shows that notifications
+answers push registrations with 501 `push not available`, and the app shows that notifications
 need the official relay. To set them:
 
 ```bash
