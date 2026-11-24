@@ -2,7 +2,7 @@ import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { exports } from 'cloudflare:workers';
 import { describe, expect, it, vi } from 'vitest';
 import { type BoardRoom, freshMemory } from '../src/boardRoom';
-import { RENEW_AFTER_S } from '../src/push/live';
+import { LIVE_SILENT_MS, RENEW_AFTER_S } from '../src/push/live';
 import type { ApnsItem } from '../src/push/types';
 import { decodeLive, encodeWant } from '../src/wire';
 import { concat, hex, sha256, toHex } from './bytes';
@@ -647,5 +647,68 @@ describe('lost contact', () => {
     await alarmAt(b.id, gone + 30 * MIN);
     expect((await sender.items()).map((i) => i.pushType)).toEqual(['liveactivity', 'liveactivity', 'alert']);
     expect(await alarmTime(b.id)).toBe(gone + 60 * MIN);
+  });
+});
+
+describe('silent board', () => {
+  async function alarmAt(id: string, ms: number): Promise<void> {
+    await setClock(id, ms);
+    await runDurableObjectAlarm(room(id));
+  }
+
+  function alarmTime(id: string): Promise<number | null> {
+    return runInDurableObject(room(id), (_o: BoardRoom, state) => state.storage.getAlarm());
+  }
+
+  /** A board in a run whose phone in slot 1 has a card, its last LIVE at NOW. */
+  async function inRun() {
+    const b = await board();
+    await registered(b, { startToken: START_1, activityToken: CARD_1, activityStartedAt: NOW_S - 100 });
+    const sender = await fakeSender(b.id);
+    b.send(live(1, [[1, blob(9)]]));
+    await eventually(async () => (await sender.items()).length === 1);
+    return { b, sender };
+  }
+
+  it('a board in a run with no LIVE for 5 minutes is taken as gone, last seen at its last frame', async () => {
+    const { b, sender } = await inRun();
+    expect(LIVE_SILENT_MS).toBe(5 * MIN);
+    expect(await alarmTime(b.id)).toBe(NOW + 5 * MIN);
+    await alarmAt(b.id, NOW + 5 * MIN - 1);
+    expect(await Promise.race([b.closed, new Promise((r) => setTimeout(() => r('open'), 50))])).toBe('open');
+    await alarmAt(b.id, NOW + 5 * MIN);
+    expect((await b.closed).code).toBe(1001);
+    expect((await rows(b.id, 'meta')).find((r) => r.key === 'last_seen')?.value).toBe(NOW_S);
+    // The lost-contact update follows 10 minutes after the last frame.
+    expect(await alarmTime(b.id)).toBe(NOW + 10 * MIN);
+    await alarmAt(b.id, NOW + 10 * MIN);
+    expect(await sender.items()).toHaveLength(2);
+    expect(aps((await sender.items())[1])['content-state']).toMatchObject({ relay: { lostAt: NOW_S } });
+  });
+
+  it('heartbeats keep it, and a run\'s end stops the watch', async () => {
+    const { b } = await inRun();
+    for (const m of [2, 4]) {
+      await at(b, NOW + m * MIN);
+      b.send(live(1, [[1, blob(9)]]));
+      await b.quiet(50);
+    }
+    await alarmAt(b.id, NOW + 5 * MIN);
+    expect(await alarmTime(b.id)).toBe(NOW + 9 * MIN);
+    await at(b, NOW + 6 * MIN);
+    b.send(live(2, [[1, blob(9)]]));
+    await b.quiet(50);
+    await alarmAt(b.id, NOW + 9 * MIN);
+    await alarmAt(b.id, NOW + 60 * MIN);
+    expect(await Promise.race([b.closed, new Promise((r) => setTimeout(() => r('open'), 50))])).toBe('open');
+    expect(await alarmTime(b.id)).toBeNull();
+  });
+
+  it('a board idle outside a run is never taken as gone', async () => {
+    const b = await board();
+    await registered(b, { startToken: START_1 });
+    expect(await alarmTime(b.id)).toBeNull();
+    await alarmAt(b.id, NOW + 120 * MIN);
+    expect(await Promise.race([b.closed, new Promise((r) => setTimeout(() => r('open'), 50))])).toBe('open');
   });
 });

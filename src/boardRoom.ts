@@ -11,6 +11,7 @@ import { type Env, pushAvailable } from './index';
 import { apnsForBlob, apnsForPresence } from './push/apnsMessage';
 import {
   LIVE_INTERVAL_MS,
+  LIVE_SILENT_MS,
   LOST_END_S,
   LOST_UPDATE_S,
   type LiveRow,
@@ -50,6 +51,8 @@ export interface BoardSocket {
   /** The board id and the host as the board dialled them (for AUTH). */
   id: string;
   host: string;
+  /** When this socket's last LIVE of a run came (ms; noted at most every 30 s); unset outside a run. */
+  liveAt?: number;
 }
 
 export interface AppSocket {
@@ -116,6 +119,10 @@ export const PUSHES_PER_HOUR = 20;
 const HOUR_MS = 3600_000;
 const MINUTE_MS = 60_000;
 const ALARM_CLASS = 3;
+/** How often a socket's `liveAt` is written down. */
+const LIVE_NOTE_MS = 30_000;
+/** The close code for a board taken as gone (no LIVE in a run for `LIVE_SILENT_MS`). */
+const CLOSE_SILENT = 1001;
 /** How long APNs keeps a push for a phone that is off: a phone off overnight still gets it. */
 const PUSH_EXPIRY_S = 86_400;
 
@@ -215,6 +222,9 @@ export class BoardRoom extends DurableObject<Env> {
       if (a.role === 'board' && !a.authed) closeSocket(ws, Close.authFailed, 'sign-in failed');
       if (a.role === 'app' && a.slot === null) closeSocket(ws, Close.policy, 'policy');
     }
+    const board = this.board();
+    const ba = board && (attachment(board) as BoardSocket);
+    if (board && ba && ba.liveAt !== undefined && now >= ba.liveAt + LIVE_SILENT_MS) this.boardSilent(board, ba);
     const seen = this.lastSeen();
     if (seen !== null && !this.board()) {
       if (now >= seen * 1000 + FORGET_MS) {
@@ -266,6 +276,7 @@ export class BoardRoom extends DurableObject<Env> {
         await this.boardPush(m);
         break;
       case Op.live:
+        await this.liveHeard(ws, a, m[2]);
         await this.boardLive(m);
         break;
       default:
@@ -888,9 +899,37 @@ export class BoardRoom extends DurableObject<Env> {
     closeSocket(ws, code, reason);
   }
 
-  /** The board left: its phones learn when it was last seen. */
-  private boardGone(): void {
-    this.setLastSeen();
+  /**
+   * A LIVE came: the socket notes it while a run is on (a start or an update), and forgets it at the
+   * run's end. A board in a run that goes quiet is taken as gone (`boardSilent`).
+   */
+  private async liveHeard(ws: WebSocket, a: BoardSocket, event: number | undefined): Promise<void> {
+    if (event === 2) {
+      if (a.liveAt !== undefined) attach(ws, { ...a, liveAt: undefined });
+      return;
+    }
+    if (event !== 0 && event !== 1) return;
+    const now = this.clock();
+    const first = a.liveAt === undefined;
+    if (!first && now >= a.liveAt! && now - a.liveAt! < LIVE_NOTE_MS) return;
+    attach(ws, { ...a, liveAt: now });
+    if (first) await this.scheduleAlarm();
+  }
+
+  /**
+   * The board sent no LIVE in a run for `LIVE_SILENT_MS`: its connection died without a close. It is
+   * taken as gone (last seen stays at its last frame) and its socket closed, so it dials again.
+   */
+  private boardSilent(ws: WebSocket, a: BoardSocket): void {
+    attach(ws, { ...a, authed: false, liveAt: undefined });
+    this.boardGone(false);
+    log(a.id, 'board silent');
+    closeSocket(ws, CLOSE_SILENT, 'silent');
+  }
+
+  /** The board left: its phones learn when it was last seen (now, unless `heard` is false). */
+  private boardGone(heard = true): void {
+    if (heard) this.setLastSeen();
     const reason = `offline ${this.lastSeen() ?? 0}`;
     for (const app of this.channels().values()) this.letGo(app, attachment(app) as AppSocket, Close.offline, reason);
   }
@@ -1016,8 +1055,11 @@ export class BoardRoom extends DurableObject<Env> {
       const pending = a.role === 'board' ? !a.authed : a.slot === null;
       if (pending && ws.readyState === WebSocket.OPEN) next = Math.min(next, a.since + SIGN_IN_MS);
     }
+    const board = this.board();
+    const liveAt = board && (attachment(board) as BoardSocket).liveAt;
+    if (typeof liveAt === 'number') next = Math.min(next, liveAt + LIVE_SILENT_MS);
     const seen = this.lastSeen();
-    if (seen !== null && !this.board()) {
+    if (seen !== null && !board) {
       next = Math.min(next, seen * 1000 + FORGET_MS);
       for (const r of this.offlineRows()) next = Math.min(next, seen * 1000 + r.offline_after * MINUTE_MS);
       const stage = this.meta('lost_stage') ?? 0;
@@ -1032,7 +1074,7 @@ export class BoardRoom extends DurableObject<Env> {
       if (!this.hasSchema()) {
         if (have !== null || this.storesAnything()) await this.ctx.storage.deleteAll();
       } else if (have !== null) await this.ctx.storage.deleteAlarm();
-    } else if (have === null || next < have) {
+    } else if (have !== next) {
       await this.ctx.storage.setAlarm(next);
     }
   }

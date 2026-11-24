@@ -16,6 +16,8 @@ export const LOST_END_S = 3600;
 export const LOST_DISMISSAL_S = 900;
 /** At most one LIVE per this from a board; an end always passes. */
 export const LIVE_INTERVAL_MS = 5_000;
+/** A board in a run sends a LIVE at least every 120 s: none for this long and it is taken as gone. */
+export const LIVE_SILENT_MS = 300_000;
 /** How long APNs keeps an end for a phone that is off; starts and updates keep until they would be stale. */
 const END_EXPIRY_S = 8 * 3600;
 /** The stale time when the board gives none. */

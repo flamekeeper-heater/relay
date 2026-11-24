@@ -59,6 +59,7 @@ the board gets CLOSE with the same code (1000 when the phone closed).
 
 | Code | To | When |
 |---|---|---|
+| 1001 | board | silent: in a run (its last LIVE a start or an update), no LIVE for 5 minutes; the relay takes the board as gone from its last frame |
 | 4001 | board, app | replaced by a newer socket (the board's, or the same phone slot's) |
 | 4002 | board | sign-in failed: bad AUTH, id, signature or host, or 10 s without AUTH |
 | 4003 | app | not paired: the token is not in the roster |
@@ -135,6 +136,8 @@ tokens reported dead (410, `BadDeviceToken`, `DeviceTokenNotForTopic`) are delet
 
 The board seals one live record per phone (AES-128-GCM with the phone's push key, AD = board id ‖
 `0x10 | event`) and sends LIVE on a run's start, its changes (a heartbeat every 120 s) and its end.
+A board in a run that sends no LIVE for 5 minutes is taken as gone (close 1001): its connection
+died without a close, and lost contact runs from its last frame.
 The relay turns each blob into an APNs request with `apns-push-type: liveactivity` and topic
 `BUNDLE_ID` + `.push-type.liveactivity`:
 
