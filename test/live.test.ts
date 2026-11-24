@@ -1,10 +1,11 @@
+import { runDurableObjectAlarm, runInDurableObject } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { SILENT_MS } from '../src/boardRoom';
+import { type BoardRoom, SILENT_MS } from '../src/boardRoom';
 import { RENEW_AFTER_S } from '../src/push/live';
 import type { ApnsItem } from '../src/push/types';
 import { decodeLive, encodeWant } from '../src/wire';
 import { concat, hex, sha256, toHex } from './bytes';
-import { type FakeBoardSocket, alarmAt, alarmTime, cardEnd, eventually, fakeApp, fakeBoard, fakeSender, logged, meta, register, rows, setClock } from './fakes';
+import { type FakeBoardSocket, alarmAt, alarmTime, cardEnd, eventually, fakeApp, fakeBoard, fakeSender, logged, meta, register, room, rows, setClock } from './fakes';
 
 const T = hex('16c1df6a87aaeae336a68c3cb93442b2246922a2edaee096e2439ee205578c0a');
 const H = hex('d91429cfba5c46b38cfeb129eb4f263b616323ad4d7c20aeb3430d641258e834');
@@ -465,5 +466,21 @@ describe('keepalive', () => {
     expect(await alarmTime(b.id)).toBe(NOW + 45_000 + 10 * MIN);
     await alarmAt(b.id, NOW + 45_000 + 10 * MIN);
     expect(aps((await sender.items())[1])['content-state']).toMatchObject({ record: b64(blob(9)), relay: { lostAt: NOW_S + 45 } });
+  });
+
+  it('a board socket with no sign-in time (from before a deploy) taken as silent is last seen now, not forgotten', async () => {
+    const b = await board();
+    await runInDurableObject(room(b.id), (o: BoardRoom, state) => {
+      for (const ws of state.getWebSockets('board')) {
+        const { authedAt: _, ...old } = ws.deserializeAttachment() as Record<string, unknown>;
+        ws.serializeAttachment(old);
+      }
+      o.clock = () => NOW + 5000;
+      o.pingAt = () => null;
+    });
+    await runDurableObjectAlarm(room(b.id));
+    expect(await b.closed).toEqual({ code: 1001, reason: 'silent' });
+    expect(await meta(b.id, 'last_seen')).toBe(NOW_S + 5);
+    expect(await rows(b.id, 'roster')).toHaveLength(2);
   });
 });

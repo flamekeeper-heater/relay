@@ -275,7 +275,8 @@ export class BoardRoom extends DurableObject<Env> {
   /** The board left: it was last seen at `seenMs`, and its phones learn that. */
   private boardGone(board: WebSocket, seenMs: number): void {
     attach(board, { ...(attachment(board) as BoardSocket), authedAt: null });
-    const seen = Math.floor(seenMs / 1000);
+    // A socket from before a deploy may carry no sign-in time: last seen is then now, never 0 (which would forget the board).
+    const seen = Math.floor((seenMs > 0 ? seenMs : this.clock()) / 1000);
     this.store.setMeta('last_seen', seen);
     this.closePhones(Close.offline, `offline ${seen}`);
   }
