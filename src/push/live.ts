@@ -87,12 +87,12 @@ export function lateEndRequest(r: Registration, record: Uint8Array, nowS: number
 
 function end(r: Registration, content: ApnsPayload, nowS: number, dismissalS: number): Send {
   const aps = { timestamp: nowS, event: LIVE_EVENT_NAMES[LiveEvent.end], 'content-state': content, 'dismissal-date': nowS + dismissalS };
-  return { slot: r.slot, kind: 'activity', event: 'end', item: item(r, r.activity_token!, 10, nowS + END_EXPIRY_S, aps), after: 'forgetCard' };
+  return { slot: r.slot, kind: 'activity', event: 'end', item: item(r, 'activity', 10, nowS + END_EXPIRY_S, aps), after: 'forgetCard' };
 }
 
 function updateItem(r: Registration, content: ApnsPayload, nowS: number, staleS: number, priority: 5 | 10): ApnsItem {
   const aps = { timestamp: nowS, event: LIVE_EVENT_NAMES[LiveEvent.update], 'content-state': content, 'stale-date': nowS + staleS };
-  return item(r, r.activity_token!, priority, nowS + Math.max(staleS, 60), aps);
+  return item(r, 'activity', priority, nowS + Math.max(staleS, 60), aps);
 }
 
 function startItem(r: Registration, content: ApnsPayload, boardId: string, nowS: number, staleS: number): ApnsItem {
@@ -107,9 +107,11 @@ function startItem(r: Registration, content: ApnsPayload, boardId: string, nowS:
   };
   // iOS 18 sends the new card's update token back to the app at once.
   if (iosMajor(r.ios) >= IOS_INPUT_PUSH_TOKEN) aps['input-push-token'] = 1;
-  return item(r, r.start_token!, 10, nowS + Math.max(staleS, 60), aps);
+  return item(r, 'start', 10, nowS + Math.max(staleS, 60), aps);
 }
 
-function item(r: Registration, token: string, priority: 5 | 10, expiration: number, aps: ApnsPayload): ApnsItem {
-  return { env: r.env, token, pushType: 'liveactivity', priority, expiration, payload: { aps } };
+/** A request to the slot's start or card token, in the environment that took that token. */
+function item(r: Registration, kind: 'start' | 'activity', priority: 5 | 10, expiration: number, aps: ApnsPayload): ApnsItem {
+  const [token, env] = kind === 'start' ? [r.start_token!, r.start_env] : [r.activity_token!, r.activity_env];
+  return { env: env ?? r.env, token, pushType: 'liveactivity', priority, expiration, payload: { aps } };
 }

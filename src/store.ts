@@ -6,7 +6,7 @@
 // they are not read, and go with the room.)
 
 import type { RegistrationBody } from './push/registry';
-import type { Registration, TokenKind } from './push/types';
+import type { ApnsEnv, Registration, TokenKind } from './push/types';
 
 /** The numbers a room keeps, all UTC seconds but `live_run` (the board's run id) and `lost_stage`. */
 export type MetaKey =
@@ -37,8 +37,16 @@ export class Store {
         `CREATE TABLE IF NOT EXISTS registration (slot INTEGER PRIMARY KEY, env TEXT NOT NULL, device TEXT,
            offline_after INTEGER NOT NULL DEFAULT 0, offline_sent INTEGER NOT NULL DEFAULT 0,
            start_token TEXT, activity_token TEXT, activity_started INTEGER, ios TEXT,
-           no_start_run INTEGER)`,
+           no_start_run INTEGER, start_env TEXT, activity_env TEXT)`,
       );
+      // Columns added after the table first went live (2026-11-24); a room made before gets them here.
+      for (const column of ['start_env TEXT', 'activity_env TEXT']) {
+        try {
+          this.storage.sql.exec(`ALTER TABLE registration ADD COLUMN ${column}`);
+        } catch {
+          // already there
+        }
+      }
       this.made = true;
     }
     return this.storage.sql;
@@ -104,14 +112,21 @@ export class Store {
     return m;
   }
 
-  /** Replaces what the phone registered; what the relay remembers of the slot (its run) stays. */
+  /**
+   * Replaces what the phone registered; what the relay remembers of the slot stays (its run, and the
+   * environment of a token sent again). A new card token is tried first where the last start went.
+   */
   putRegistration(slot: number, r: RegistrationBody): void {
     this.sql.exec(
       `INSERT INTO registration (slot, env, device, offline_after, start_token, activity_token, activity_started, ios)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (slot) DO UPDATE SET env = excluded.env, device = excluded.device, offline_after = excluded.offline_after,
          start_token = excluded.start_token, activity_token = excluded.activity_token,
-         activity_started = excluded.activity_started, ios = excluded.ios`,
+         activity_started = excluded.activity_started, ios = excluded.ios,
+         start_env = CASE WHEN registration.start_token IS excluded.start_token THEN registration.start_env END,
+         activity_env = CASE WHEN excluded.activity_token IS NULL THEN NULL
+           WHEN registration.activity_token IS excluded.activity_token THEN registration.activity_env
+           ELSE registration.start_env END`,
       slot,
       r.env,
       r.device,
@@ -131,8 +146,15 @@ export class Store {
   forgetToken(slot: number, kind: TokenKind, token: string): void {
     const column = TOKEN_COLUMN[kind];
     this.sql.exec(`UPDATE registration SET ${column} = NULL WHERE slot = ? AND ${column} = ?`, slot, token);
-    this.sql.exec(`UPDATE registration SET activity_started = NULL WHERE slot = ? AND activity_token IS NULL`, slot);
+    this.sql.exec(`UPDATE registration SET activity_started = NULL, activity_env = NULL WHERE slot = ? AND activity_token IS NULL`, slot);
+    this.sql.exec(`UPDATE registration SET start_env = NULL WHERE slot = ? AND start_token IS NULL`, slot);
     this.sql.exec(`DELETE FROM registration WHERE slot = ? AND device IS NULL AND start_token IS NULL AND activity_token IS NULL`, slot);
+  }
+
+  /** The environment that took this start or card token, when it is not the registration's. */
+  setTokenEnv(slot: number, kind: 'start' | 'activity', token: string, env: ApnsEnv): void {
+    const [column, envColumn] = kind === 'start' ? ['start_token', 'start_env'] : ['activity_token', 'activity_env'];
+    this.sql.exec(`UPDATE registration SET ${envColumn} = ? WHERE slot = ? AND ${column} = ?`, env, slot, token);
   }
 
   /** No (further) push-to-start for this slot in `run`. */

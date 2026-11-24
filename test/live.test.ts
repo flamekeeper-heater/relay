@@ -121,6 +121,33 @@ describe('LIVE decoding', () => {
   });
 });
 
+describe('token environments', () => {
+  it('a start or card token refused in its env is tried in the other once, remembered there, and the card follows its start; a device token is not', async () => {
+    const b = await board();
+    const DEVICE_2 = 'd2'.repeat(32);
+    await registered(b, { startToken: START_1, iosVersion: '18.1' }, { startToken: START_2, device: DEVICE_2, iosVersion: '18.1' });
+    // The phone in slot 2 is a development build holding a production install's Live Activity tokens.
+    const sender = await fakeSender(b.id, (i) => (i.token === DEVICE_2 || i.env === 'sandbox' ? 'gone' : 'sent'));
+    b.send(live(0, [2], blob(1)));
+    await eventually(async () => (await row(b.id, 2)).start_env === 'production');
+    expect((await sender.items()).map((i) => [i.token, i.env])).toEqual([
+      [START_2, 'sandbox'],
+      [START_2, 'production'],
+    ]);
+    expect(await row(b.id, 2)).toMatchObject({ start_token: START_2, no_start_run: RUN });
+    expect((await register(b.id, T, { env: 'sandbox', startToken: START_2, device: DEVICE_2, activityToken: CARD_2, activityStartedAt: NOW_S, iosVersion: '18.1' })).status).toBe(204);
+    await b.next();
+    expect(await row(b.id, 2)).toMatchObject({ start_env: 'production', activity_env: 'production' });
+    b.send(live(1, [2], blob(2)));
+    await eventually(async () => (await sender.items()).length === 3);
+    expect((await sender.items())[2]).toMatchObject({ token: CARD_2, env: 'production' });
+    // A refused device token is dropped without a second try.
+    b.send(concat(new Uint8Array([0, 6, 1, 1, 2, 40]), new Uint8Array(40).fill(7)));
+    await eventually(async () => (await row(b.id, 2)).device === null);
+    expect((await sender.items()).slice(3).map((i) => [i.token, i.env])).toEqual([[DEVICE_2, 'sandbox']]);
+  });
+});
+
 describe('a card that ended', () => {
   it('drops its token; a card swiped away also blocks push-to-start for the rest of the run', async () => {
     const b = await board();

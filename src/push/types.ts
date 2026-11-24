@@ -21,6 +21,12 @@ export type Registration = {
   /** The update token of the phone's current card, and when that card started (UTC seconds). */
   activity_token: string | null;
   activity_started: number | null;
+  /**
+   * The APNs environment that took the start token or the card token, when it is not `env`: iOS may
+   * hand a development build the Live Activity tokens of a production (TestFlight) install.
+   */
+  start_env: ApnsEnv | null;
+  activity_env: ApnsEnv | null;
   /** The phone's iOS version, `major.minor[.patch]`. */
   ios: string | null;
   /** The run in which this phone gets no (further) push-to-start: one was sent, or it swiped its card away. */

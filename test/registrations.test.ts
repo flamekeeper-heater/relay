@@ -107,6 +107,8 @@ describe('push registrations', () => {
         activity_started: 7,
         ios: '17.2',
         no_start_run: null,
+        start_env: null,
+        activity_env: null,
       },
     ]);
   });

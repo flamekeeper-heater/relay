@@ -11,7 +11,7 @@ import { type Env, pushAvailable } from './index';
 import { type AlertMessage, apnsForBlob, apnsForOffline } from './push/apnsMessage';
 import { LOST_END_S, LOST_UPDATE_S, lateEndRequest, liveRequests, lostContactRequests } from './push/live';
 import { REGISTRATION_MAX, parseBearer, parseCardEnd, parseRegistration } from './push/registry';
-import type { ApnsOutcome, PushSend, Registration, Send } from './push/types';
+import type { ApnsItem, ApnsOutcome, PushSend, Registration, Send } from './push/types';
 import { type Masks, Store } from './store';
 import {
   CHALLENGE_BYTES,
@@ -529,13 +529,18 @@ export class BoardRoom extends DurableObject<Env> {
    * changed. The log names each send's event, token kind, environment and outcome, nothing more.
    */
   private async deliver(what: string, sends: Send[], more: Record<string, unknown> = {}): Promise<ApnsOutcome[]> {
-    let outcomes: ApnsOutcome[];
-    try {
-      outcomes = sends.length === 0 ? [] : await this.pushSender(sends.map((s) => s.item));
-    } catch (e) {
-      this.log('sender failed', { error: e instanceof Error ? e.name : 'unknown' });
-      outcomes = sends.map(() => 'failed');
-    }
+    const outcomes = await this.send(sends.map((s) => s.item));
+    // A start or card token refused in one environment is tried once in the other, and remembered
+    // there if it is taken: iOS may hand a development build a production install's Live Activity tokens.
+    const refused = sends.flatMap((s, i) => (outcomes[i] === 'gone' && s.kind !== 'device' ? [i] : []));
+    const flipped = refused.map((i) => ({ ...sends[i].item, env: sends[i].item.env === 'sandbox' ? ('production' as const) : ('sandbox' as const) }));
+    const again = await this.send(flipped);
+    refused.forEach((i, k) => {
+      if (again[k] === 'gone') return;
+      sends[i] = { ...sends[i], item: flipped[k] };
+      outcomes[i] = again[k];
+      if (again[k] === 'sent') this.store.setTokenEnv(sends[i].slot, sends[i].kind as 'start' | 'activity', flipped[k].token, flipped[k].env);
+    });
     const before = this.store.masks();
     sends.forEach((s, i) => {
       const o = outcomes[i] ?? 'failed';
@@ -546,6 +551,17 @@ export class BoardRoom extends DurableObject<Env> {
     this.log(what, { ...more, sends: sends.map((s, i) => ({ push: s.event, to: s.kind, env: s.item.env, outcome: outcomes[i] ?? 'failed' })) });
     this.wantIfChanged(before);
     return outcomes;
+  }
+
+  /** Hands the items to the APNs sender; all failed if it cannot be reached. */
+  private async send(items: ApnsItem[]): Promise<ApnsOutcome[]> {
+    if (items.length === 0) return [];
+    try {
+      return await this.pushSender(items);
+    } catch (e) {
+      this.log('sender failed', { error: e instanceof Error ? e.name : 'unknown' });
+      return items.map(() => 'failed');
+    }
   }
 
   /**

@@ -153,6 +153,11 @@ late end:
 | board away 10 min | `update` with `relay.lostAt` (when the board was last seen) and the last record | card tokens |
 | board away 60 min | `end`, dismissal 900 s, then the tokens are dropped | card tokens |
 
+A start or card token APNs calls dead (410, `BadDeviceToken`, `DeviceTokenNotForTopic`) in the registration's `env` is tried once
+in the other environment; if that one takes it, the relay keeps sending that token there (iOS may
+hand a development build the Live Activity tokens of a production install). A card token registered
+after a start is tried first where that start went. The device token always uses `env`.
+
 `aps`: `timestamp` (now), `event`, `content-state`, `stale-date` (now + the board's stale s) for
 start and update; a push-to-start adds `attributes-type: "HeaterActivityAttributes"`, `attributes:
 {board: <board id>}`, `alert: {title: "Flamekeeper", body: {loc-key: "card.started"}}` (no sound;
