@@ -111,7 +111,7 @@ const BLOB_MIN = 28;
 const CLASS_MAX = 3;
 
 /**
- * The blobs that end a PUSH or a LIVE: `n` × (u8 slot 0-7, u8 length ≥ 28, blob) from offset `o`,
+ * The blobs that end a PUSH: `n` × (u8 slot 0-7, u8 length ≥ 28, blob) from offset `o`,
  * slots unique, the lengths exactly filling the message. The blobs are the board's, sealed per phone.
  */
 function decodeBlobs(m: Uint8Array, o: number, n: number): Map<number, Uint8Array> | null {
@@ -152,6 +152,8 @@ export const LiveEvent = { start: 0, update: 1, end: 2 } as const;
 export const LIVE_EVENT_NAMES = ['start', 'update', 'end'] as const;
 const NO_STARTER = 0xff;
 const LIVE_HEAD = 14;
+/** The longest record a LIVE may carry; the relay passes it on unread. */
+const RECORD_MAX = 64;
 
 export interface Live {
   event: 0 | 1 | 2;
@@ -161,36 +163,33 @@ export interface Live {
   staleS: number;
   /** For an end: seconds the final card stays. */
   dismissalS: number;
-  /** The slot of the phone that started the run; null for none. */
-  starter: number | null;
   /** The board's id for this run, never 0. */
   run: number;
-  /** Per slot, the live record sealed for that phone. */
-  blobs: Map<number, Uint8Array>;
+  /** The slots of the phones this LIVE is for, a bit each. */
+  slots: number;
+  /** The live record, the same for every phone, not sealed. */
+  record: Uint8Array;
 }
 
 /**
  * LIVE: `00 07` ‖ u8 event 0-2 ‖ u8 flags ‖ u16 stale s ‖ u16 dismissal s ‖ u8 starter slot
- * (0xFF none) ‖ u32 run id (not 0) ‖ u8 n ≤ 8 ‖ the blobs.
+ * (0xFF none; not used by the relay) ‖ u32 run id (not 0) ‖ u8 slots ‖ the record (1-64 bytes).
  */
 export function decodeLive(m: Uint8Array): Live | null {
-  if (m.length < LIVE_HEAD || m[0] !== 0 || m[1] !== Op.live) return null;
+  if (m.length <= LIVE_HEAD || m.length > LIVE_HEAD + RECORD_MAX || m[0] !== 0 || m[1] !== Op.live) return null;
   const event = m[2];
   const starter = m[8];
   const run = (m[9] | (m[10] << 8) | (m[11] << 16) | (m[12] << 24)) >>> 0;
   if (event > LiveEvent.end || (starter >= SLOTS && starter !== NO_STARTER) || run === 0) return null;
-  const blobs = decodeBlobs(m, LIVE_HEAD, m[13]);
-  return (
-    blobs && {
-      event: event as 0 | 1 | 2,
-      important: (m[3] & 1) !== 0,
-      staleS: m[4] | (m[5] << 8),
-      dismissalS: m[6] | (m[7] << 8),
-      starter: starter === NO_STARTER ? null : starter,
-      run,
-      blobs,
-    }
-  );
+  return {
+    event: event as 0 | 1 | 2,
+    important: (m[3] & 1) !== 0,
+    staleS: m[4] | (m[5] << 8),
+    dismissalS: m[6] | (m[7] << 8),
+    run,
+    slots: m[13],
+    record: m.slice(LIVE_HEAD),
+  };
 }
 
 export function encodeClose(channel: number, code: number): Uint8Array {

@@ -107,8 +107,6 @@ describe('push registrations', () => {
         activity_started: 7,
         ios: '17.2',
         no_start_run: null,
-        live_blob: null,
-        live_event: null,
       },
     ]);
   });

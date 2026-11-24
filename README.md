@@ -20,8 +20,8 @@ Wi-Fi key, so nothing new is exchanged when pairing.
 For push notifications the board decides what to send, filters it per phone and encrypts one blob
 per phone. The relay adds the phone's device token and hands the request to Apple's push service
 (APNs). It also tells phones, if they asked, when their heater has been offline for a while. Live
-cards (iOS Live Activities) work the same way: the board seals the card's content per phone, and the
-relay sends it to that phone's card, starts a card on phones that want one, renews cards at 8 hours
+cards (iOS Live Activities) are the exception: the board sends the card's content once, not sealed,
+and the relay sends it to each phone's card, starts a card on phones that want one, renews cards at 8 hours
 and greys them out when it loses the board.
 
 What the relay keeps: per board, the list of phone token hashes, when it was last seen, and the

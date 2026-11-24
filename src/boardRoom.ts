@@ -449,8 +449,8 @@ export class BoardRoom extends DurableObject<Env> {
   }
 
   /**
-   * A LIVE from the board: per phone it sealed a record for, an update to its card, a push-to-start
-   * or the card's end (`liveRequests`). Each phone's last blob is kept for lost contact.
+   * A LIVE from the board: per phone it is for, an update to its card, a push-to-start or the card's
+   * end (`liveRequests`). The record is kept for lost contact and a late end.
    */
   private async boardLive(m: Uint8Array): Promise<void> {
     const l = decodeLive(m);
@@ -464,10 +464,10 @@ export class BoardRoom extends DurableObject<Env> {
     this.store.setMeta('live_run', ended ? null : l.run);
     this.store.setMeta('live_ended', ended ? nowS : null);
     this.store.setMeta('live_end_until', ended ? nowS + l.dismissalS : null);
-    this.store.setBlobs(l.blobs, l.event);
+    this.store.setRecord(l.record);
     const sends = liveRequests(l, this.store.registrations(), this.id, nowS);
     const what = `live ${LIVE_EVENT_NAMES[l.event]}`;
-    const outcomes = await this.deliver(what, sends, { slots: [...l.blobs.keys()], starter: l.starter });
+    const outcomes = await this.deliver(what, sends, { slots: [0, 1, 2, 3, 4, 5, 6, 7].filter((s) => l.slots & (1 << s)) });
     const next = sends.flatMap((s, i) => (s.next && outcomes[i] === 'sent' ? [s.next] : []));
     if (next.length > 0) await this.deliver(`${what}, old cards`, next);
   }
@@ -479,8 +479,9 @@ export class BoardRoom extends DurableObject<Env> {
   private lateEnd(slot: number): Send | null {
     const ended = this.store.meta('live_ended');
     const r = this.store.registration(slot);
-    if (ended === null || !r || r.activity_started === null || r.activity_started >= ended) return null;
-    return lateEndRequest(r, Math.floor(this.clock() / 1000), this.store.meta('live_end_until') ?? ended);
+    const record = this.store.record();
+    if (ended === null || !r || !record || r.activity_started === null || r.activity_started >= ended) return null;
+    return lateEndRequest(r, record, Math.floor(this.clock() / 1000), this.store.meta('live_end_until') ?? ended);
   }
 
   /**
@@ -490,16 +491,17 @@ export class BoardRoom extends DurableObject<Env> {
   private async lostContact(now: number, seen: number): Promise<void> {
     const stage = this.store.meta('lost_stage') ?? 0;
     const rows = this.store.registrations();
-    if (!rows.some((r) => r.activity_token)) return;
+    const record = this.store.record();
+    if (!record || !rows.some((r) => r.activity_token)) return;
     const nowS = Math.floor(now / 1000);
     if (stage < 2 && nowS >= seen + LOST_END_S) {
       this.store.setMeta('lost_stage', 2);
       // A board back later in the same run may start these phones' cards again.
       this.store.allowStartOfCards();
-      await this.deliver('lost contact end', lostContactRequests(rows, seen, nowS, true));
+      await this.deliver('lost contact end', lostContactRequests(rows, record, seen, nowS, true));
     } else if (stage < 1 && nowS >= seen + LOST_UPDATE_S) {
       this.store.setMeta('lost_stage', 1);
-      await this.deliver('lost contact', lostContactRequests(rows, seen, nowS, false));
+      await this.deliver('lost contact', lostContactRequests(rows, record, seen, nowS, false));
     }
   }
 

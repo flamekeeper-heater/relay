@@ -1,6 +1,6 @@
 // What a board's room keeps in its SQLite storage: the roster (slot → SHA-256 of that phone's relay
-// token), one push registration per roster slot, and a few numbers (when the board was last seen,
-// the live cards' run). The tables are made on first use, so a room emptied by `wipe` (a board
+// token), one push registration per roster slot, a few numbers (when the board was last seen, the
+// live cards' run) and the board's last live record. The tables are made on first use, so a room emptied by `wipe` (a board
 // forgotten, or an id no board ever signed in to) holds nothing until it is used again. (A room
 // stored by a relay from before the first release may also hold its old `push` and `meta` tables:
 // they are not read, and go with the room.)
@@ -37,7 +37,7 @@ export class Store {
         `CREATE TABLE IF NOT EXISTS registration (slot INTEGER PRIMARY KEY, env TEXT NOT NULL, device TEXT,
            offline_after INTEGER NOT NULL DEFAULT 0, offline_sent INTEGER NOT NULL DEFAULT 0,
            start_token TEXT, activity_token TEXT, activity_started INTEGER, ios TEXT,
-           no_start_run INTEGER, live_blob BLOB, live_event INTEGER)`,
+           no_start_run INTEGER)`,
       );
       this.made = true;
     }
@@ -104,7 +104,7 @@ export class Store {
     return m;
   }
 
-  /** Replaces what the phone registered; what the relay remembers of the slot (its run, its last blob) stays. */
+  /** Replaces what the phone registered; what the relay remembers of the slot (its run) stays. */
   putRegistration(slot: number, r: RegistrationBody): void {
     this.sql.exec(
       `INSERT INTO registration (slot, env, device, offline_after, start_token, activity_token, activity_started, ios)
@@ -145,9 +145,13 @@ export class Store {
     this.sql.exec(`UPDATE registration SET no_start_run = NULL WHERE activity_token IS NOT NULL`);
   }
 
-  /** Keeps each slot's last sealed record, for lost contact and a late end. */
-  setBlobs(blobs: Map<number, Uint8Array>, event: number): void {
-    for (const [slot, blob] of blobs) this.sql.exec(`UPDATE registration SET live_blob = ?, live_event = ? WHERE slot = ?`, blob, event, slot);
+  /** The board's last live record, for lost contact and a late end. */
+  record(): Uint8Array | null {
+    return this.storage.kv.get<Uint8Array>('live_record') ?? null;
+  }
+
+  setRecord(record: Uint8Array): void {
+    this.storage.kv.put('live_record', record);
   }
 
   setOfflineSent(slots: number[], sent: boolean): void {

@@ -25,9 +25,6 @@ export type Registration = {
   ios: string | null;
   /** The run in which this phone gets no (further) push-to-start: one was sent, or it swiped its card away. */
   no_start_run: number | null;
-  /** The last blob the board sealed for this phone, and its LIVE event. */
-  live_blob: ArrayBuffer | null;
-  live_event: number | null;
 };
 
 /** Which of a registration's tokens a push goes to. */

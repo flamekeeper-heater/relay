@@ -1,7 +1,7 @@
-// Live cards (iOS Live Activities) away from home: the board's LIVE gives one sealed live record per
-// phone; the relay turns each into an APNs `liveactivity` request to that phone's card (its update
-// token) or, when the phone has no card, a push-to-start (its start token). The relay keeps each
-// phone's last blob, so it can say "lost contact" and renew a card at 8 hours on its own.
+// Live cards (iOS Live Activities): the board's LIVE gives one plain live record and the phones it is
+// for; the relay turns it into an APNs `liveactivity` request per phone, to its card (its update
+// token) or, when the phone has no card, a push-to-start (its start token). The relay starts every
+// card, and keeps the board's last record so it can say "lost contact" and renew a card at 8 hours.
 
 import { base64 } from '../bytes';
 import { LIVE_EVENT_NAMES, type Live, LiveEvent } from '../wire';
@@ -28,41 +28,33 @@ const RENEWED_KEY = 'card.renewed';
 
 type RelayNote = { lostAt: number } | { renewed: true };
 
-/** What the card's content state holds when it comes from the relay (`LiveContent` in the app). */
-function contentState(blob: Uint8Array | null, event: number, card: number | null, relay?: RelayNote): ApnsPayload {
-  return {
-    v: 1,
-    ...(blob ? { sealed: base64(blob), e: event } : {}),
-    ...(card === null ? {} : { card }),
-    via: 'internet',
-    ...(relay ? { relay } : {}),
-  };
+/** The card's content state (`LiveContent` in the app): the record, the card's start, the relay's note. */
+function contentState(record: Uint8Array, card: number | null, relay?: RelayNote): ApnsPayload {
+  return { v: 2, record: base64(record), ...(card === null ? {} : { card }), ...(relay ? { relay } : {}) };
 }
 
-/** The requests for one LIVE: per slot the board sealed a record for and that has a registration. */
+/** The requests for one LIVE: per registered phone it is for. */
 export function liveRequests(l: Live, rows: Registration[], boardId: string, nowS: number): Send[] {
   const out: Send[] = [];
-  const bySlot = new Map(rows.map((r) => [r.slot, r]));
   const staleS = l.staleS || DEFAULT_STALE_S;
   const priority = l.important || l.event !== LiveEvent.update ? 10 : 5;
-  for (const [slot, blob] of l.blobs) {
-    const r = bySlot.get(slot);
-    if (!r) continue;
-    const content = contentState(blob, l.event, r.activity_started);
+  for (const r of rows) {
+    const slot = r.slot;
+    if (!(l.slots & (1 << slot))) continue;
+    const content = contentState(l.record, r.activity_started);
     const start = (relay?: { renewed: true }): Send => ({
       slot,
       kind: 'start',
       event: 'start',
-      item: startItem(r, contentState(blob, l.event, nowS, relay), boardId, nowS, staleS),
+      item: startItem(r, contentState(l.record, nowS, relay), boardId, nowS, staleS),
       after: 'started',
       run: l.run,
     });
     if (l.event === LiveEvent.end) {
       if (r.activity_token) out.push(end(r, content, nowS, l.dismissalS));
     } else if (!r.activity_token) {
-      // No card: start one, unless this phone started the run (its app made its own card), or was
-      // already sent a start or swiped its card away in this run.
-      if (r.start_token && slot !== l.starter && r.no_start_run !== l.run) out.push(start());
+      // No card: start one, unless this phone was already sent a start or swiped its card away in this run.
+      if (r.start_token && r.no_start_run !== l.run) out.push(start());
     } else if (r.start_token && r.activity_started !== null && nowS >= r.activity_started + RENEW_AFTER_S) {
       // A renewal: the new card, and once APNs took it the old one goes at once.
       out.push({ ...start({ renewed: true }), next: end(r, content, nowS, 0) });
@@ -75,13 +67,13 @@ export function liveRequests(l: Live, rows: Registration[], boardId: string, now
 
 /**
  * The board has been away since `lostAt`: per slot with a card, an update saying so, or (`ended`)
- * the card's end, with the last record the board sealed for that phone.
+ * the card's end, with the board's last record.
  */
-export function lostContactRequests(rows: Registration[], lostAt: number, nowS: number, ended: boolean): Send[] {
+export function lostContactRequests(rows: Registration[], record: Uint8Array, lostAt: number, nowS: number, ended: boolean): Send[] {
   return rows
     .filter((r) => r.activity_token)
     .map((r) => {
-      const content = contentState(lastBlob(r), r.live_event ?? LiveEvent.update, r.activity_started, { lostAt });
+      const content = contentState(record, r.activity_started, { lostAt });
       return ended
         ? end(r, content, nowS, LOST_DISMISSAL_S)
         : { slot: r.slot, kind: 'activity', event: 'update', item: updateItem(r, content, nowS, 0, 10) };
@@ -89,12 +81,8 @@ export function lostContactRequests(rows: Registration[], lostAt: number, nowS: 
 }
 
 /** The end for a card whose token came after its run ended: kept until the run's own dismissal. */
-export function lateEndRequest(r: Registration, nowS: number, untilS: number): Send {
-  return end(r, contentState(lastBlob(r), r.live_event ?? LiveEvent.end, r.activity_started), nowS, Math.max(0, untilS - nowS));
-}
-
-function lastBlob(r: Registration): Uint8Array | null {
-  return r.live_blob ? new Uint8Array(r.live_blob) : null;
+export function lateEndRequest(r: Registration, record: Uint8Array, nowS: number, untilS: number): Send {
+  return end(r, contentState(record, r.activity_started), nowS, Math.max(0, untilS - nowS));
 }
 
 function end(r: Registration, content: ApnsPayload, nowS: number, dismissalS: number): Send {

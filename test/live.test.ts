@@ -19,29 +19,19 @@ const MIN = 60_000;
 /** The run id the board gives a run unless a test says otherwise. */
 const RUN = 0x0102_0003;
 
-// The live card vector (apps/ios/FlamekeeperKit/Tests/FlamekeeperKitTests/Vectors/live.json): an
-// update's record sealed for one phone, and the content state the relay sends for it.
-const VECTOR_BLOB = hex(
-  '010101010101010101010101dee795673ed1a003854d2fde33e72751d2a6f3abdc34b974ea9b646c32bdf3a241faa5b5587acda7e9e51a74b16b40320c',
-);
-const VECTOR_SEALED = 'AQEBAQEBAQEBAQEB3ueVZz7RoAOFTS/eM+cnUdKm86vcNLl06ptkbDK986JB+qW1WHrNp+nlGnSxa0AyDA==';
-
-// The LIVE vectors of PROTOCOL.md: slot 2, starter 2, run 42, stale 360.
+// The LIVE vectors of PROTOCOL.md: slot 2, starter 2, run 42, stale 360, the record 33 × d0..f0.
+const RECORD = Uint8Array.from({ length: 33 }, (_, i) => 0xd0 + i);
 const FRAMES = {
-  start: '0007000168010000022a00000001023dd0d1d2d3d4d5d6d7d8d9dadb9714fb592e976ff78314ad15786657c1dbc3c4f280159ff94e12e4d9f6c093ee2e9a76bdb8f90cb06883d3005c0d75aaaf',
-  update: '0007010068010000022a00000001023dd0d1d2d3d4d5d6d7d8d9dadb9714fb592e976ff78314ad15786657c1dbc3c4f280159ff94e12e4d9f6c093ee2efe149027d8e2dc28e58eb47e3452ab34',
-  end: '0007020368018403022a00000001023dd0d1d2d3d4d5d6d7d8d9dadb9714fb592e976ff78314ad15786657c1dbc3c4f280159ff94e12e4d9f6c093ee2e52b2e686bad068e84f6868187f3ba999',
-};
-const FRAME_BLOBS = {
-  start: 'd0d1d2d3d4d5d6d7d8d9dadb9714fb592e976ff78314ad15786657c1dbc3c4f280159ff94e12e4d9f6c093ee2e9a76bdb8f90cb06883d3005c0d75aaaf',
-  update: 'd0d1d2d3d4d5d6d7d8d9dadb9714fb592e976ff78314ad15786657c1dbc3c4f280159ff94e12e4d9f6c093ee2efe149027d8e2dc28e58eb47e3452ab34',
-  end: 'd0d1d2d3d4d5d6d7d8d9dadb9714fb592e976ff78314ad15786657c1dbc3c4f280159ff94e12e4d9f6c093ee2e52b2e686bad068e84f6868187f3ba999',
+  start: `0007000168010000022a00000004${toHex(RECORD)}`,
+  update: `0007010068010000022a00000004${toHex(RECORD)}`,
+  end: `0007020368018403022a00000004${toHex(RECORD)}`,
 };
 
-/** `00 07` ‖ event ‖ flags ‖ u16 stale ‖ u16 dismissal ‖ starter ‖ u32 run ‖ n ‖ n × (slot, length, blob). */
+/** `00 07` ‖ event ‖ flags ‖ u16 stale ‖ u16 dismissal ‖ starter ‖ u32 run ‖ slots ‖ the record. */
 function live(
   event: number,
-  entries: Array<[slot: number, blob: Uint8Array]>,
+  slots: number[],
+  record: Uint8Array,
   o: { important?: boolean; stale?: number; dismissal?: number; starter?: number | null; run?: number } = {},
 ): Uint8Array {
   const stale = o.stale ?? 360;
@@ -49,14 +39,16 @@ function live(
   const flags = o.important ?? event !== 1 ? 1 : 0;
   const run = o.run ?? RUN;
   const starter = o.starter === undefined || o.starter === null ? 0xff : o.starter;
+  const mask = slots.reduce((m, s) => m | (1 << s), 0);
   return concat(
-    new Uint8Array([0, 7, event, flags, stale & 0xff, stale >> 8, dismissal & 0xff, dismissal >> 8, starter, run & 0xff, (run >> 8) & 0xff, (run >> 16) & 0xff, run >>> 24, entries.length]),
-    ...entries.map(([slot, b]) => concat(new Uint8Array([slot, b.length]), b)),
+    new Uint8Array([0, 7, event, flags, stale & 0xff, stale >> 8, dismissal & 0xff, dismissal >> 8, starter, run & 0xff, (run >> 8) & 0xff, (run >> 16) & 0xff, run >>> 24, mask]),
+    record,
   );
 }
 
+/** A 33-byte record. */
 function blob(fill: number): Uint8Array {
-  return new Uint8Array(61).fill(fill);
+  return new Uint8Array(33).fill(fill);
 }
 
 function b64(b: Uint8Array): string {
@@ -111,27 +103,20 @@ describe('LIVE decoding', () => {
       end: { event: 2, important: true, dismissalS: 900 },
     } as const;
     for (const k of ['start', 'update', 'end'] as const) {
-      const l = decodeLive(hex(FRAMES[k]))!;
-      expect(l).toMatchObject({ ...expected[k], staleS: 360, starter: 2, run: 42 });
-      expect([...l.blobs.keys()]).toEqual([2]);
-      expect(toHex(l.blobs.get(2)!)).toBe(FRAME_BLOBS[k]);
+      expect(decodeLive(hex(FRAMES[k]))).toEqual({ ...expected[k], staleS: 360, run: 42, slots: 4, record: RECORD });
     }
     expect(toHex(encodeWant(4, 4, 4))).toBe('0008040404');
-    expect(decodeLive(live(1, [[1, blob(1)]], { starter: null, run: 0xfedcba98 }))).toMatchObject({ starter: null, run: 0xfedcba98 });
+    expect(decodeLive(live(1, [1], blob(1), { starter: null, run: 0xfedcba98 }))).toMatchObject({ run: 0xfedcba98, slots: 2 });
   });
 
   it('refuses bad frames', () => {
-    const good = live(1, [[1, blob(1)]]);
+    const good = live(1, [1], blob(1));
     expect(decodeLive(good)).not.toBeNull();
-    expect(decodeLive(live(3, [[1, blob(1)]]))).toBeNull();
-    expect(decodeLive(live(1, [[1, blob(1)]], { starter: 8 }))).toBeNull();
-    expect(decodeLive(live(1, [[1, blob(1)]], { run: 0 }))).toBeNull();
-    expect(decodeLive(live(1, [[8, blob(1)]]))).toBeNull();
-    expect(decodeLive(live(1, [[1, blob(1)], [1, blob(2)]]))).toBeNull();
-    expect(decodeLive(live(1, [[1, new Uint8Array(27)]]))).toBeNull();
-    expect(decodeLive(good.subarray(0, good.length - 1))).toBeNull();
-    expect(decodeLive(concat(good, new Uint8Array([0])))).toBeNull();
-    expect(decodeLive(good.subarray(0, 13))).toBeNull();
+    expect(decodeLive(live(3, [1], blob(1)))).toBeNull();
+    expect(decodeLive(live(1, [1], blob(1), { starter: 8 }))).toBeNull();
+    expect(decodeLive(live(1, [1], blob(1), { run: 0 }))).toBeNull();
+    expect(decodeLive(good.subarray(0, 14))).toBeNull();
+    expect(decodeLive(live(1, [1], new Uint8Array(65)))).toBeNull();
   });
 });
 
@@ -140,7 +125,7 @@ describe('a card that ended', () => {
     const b = await board();
     await registered(b, { startToken: START_1, activityToken: CARD_1, activityStartedAt: NOW_S }, { startToken: START_2, activityToken: CARD_2, activityStartedAt: NOW_S });
     const sender = await fakeSender(b.id);
-    b.send(live(0, [[1, blob(1)], [2, blob(2)]]));
+    b.send(live(0, [1, 2], blob(1)));
     await eventually(async () => (await sender.items()).length === 2);
     expect((await cardEnd(b.id, T1, null)).status).toBe(204);
     expect(toHex(await b.next())).toBe('0008000406');
@@ -149,11 +134,11 @@ describe('a card that ended', () => {
     expect(toHex(await b.next())).toBe('0008000006');
     expect((await row(b.id, 2)).no_start_run).toBe(RUN);
     // The next update starts a card again for the phone whose card just ended, not for the one that swiped.
-    b.send(live(1, [[1, blob(1)], [2, blob(2)]]));
+    b.send(live(1, [1, 2], blob(1)));
     await eventually(async () => (await sender.items()).length === 3);
     expect((await sender.items())[2].token).toBe(START_1);
     // The next run starts one for both.
-    b.send(live(0, [[2, blob(2)]], { run: RUN + 1 }));
+    b.send(live(0, [2], blob(2), { run: RUN + 1 }));
     await eventually(async () => (await sender.items()).length === 4);
     expect((await sender.items())[3].token).toBe(START_2);
   });
@@ -170,34 +155,35 @@ describe('a card that ended', () => {
 });
 
 describe('LIVE to Live Activity pushes', () => {
-  it('a start sends push-to-start to each startable phone but the starter', async () => {
+  it('a start sends push-to-start to every startable phone, the starter too, with the one record', async () => {
     const b = await board();
     await registered(b);
     const sender = await fakeSender(b.id);
-    b.send(live(0, [[1, blob(1)], [2, blob(2)]], { starter: 1 }));
-    await eventually(async () => (await sender.items()).length === 1);
-    const [i] = await sender.items();
-    expect(i).toMatchObject({ env: 'sandbox', token: START_2, pushType: 'liveactivity', priority: 10, expiration: NOW_S + 360 });
+    b.send(live(0, [1, 2], blob(1), { starter: 1 }));
+    await eventually(async () => (await sender.items()).length === 2);
+    const i = (await sender.items()).find((x) => x.token === START_2)!;
+    expect(i).toMatchObject({ env: 'sandbox', pushType: 'liveactivity', priority: 10, expiration: NOW_S + 360 });
     expect(aps(i)).toEqual({
       timestamp: NOW_S,
       event: 'start',
-      'content-state': { v: 1, sealed: b64(blob(2)), e: 0, card: NOW_S, via: 'internet' },
+      'content-state': { v: 2, record: b64(blob(1)), card: NOW_S },
       'stale-date': NOW_S + 360,
       'attributes-type': 'HeaterActivityAttributes',
       attributes: { board: b.id },
       alert: { title: 'Flamekeeper', body: { 'loc-key': 'card.started' } },
       'input-push-token': 1,
     });
+    expect((await sender.items()).map((x) => x.token).sort()).toEqual([START_1, START_2]);
     expect(await b.quiet()).toBe(true);
+    expect((await row(b.id, 1)).no_start_run).toBe(RUN);
     expect((await row(b.id, 2)).no_start_run).toBe(RUN);
-    expect((await row(b.id, 1)).no_start_run).toBeNull();
   });
 
   it('iOS 17 gets no input-push-token', async () => {
     const b = await board();
     await registered(b);
     const sender = await fakeSender(b.id);
-    b.send(live(0, [[1, blob(1)]]));
+    b.send(live(0, [1], blob(1)));
     await eventually(async () => (await sender.items()).length === 1);
     expect(aps((await sender.items())[0])['input-push-token']).toBeUndefined();
   });
@@ -206,40 +192,31 @@ describe('LIVE to Live Activity pushes', () => {
     const b = await board();
     await registered(b, { activityToken: CARD_1, activityStartedAt: NOW_S - 100, startToken: START_1 });
     const sender = await fakeSender(b.id);
-    b.send(live(1, [[1, blob(1)]]));
-    b.send(live(1, [[1, blob(3)]], { important: true, stale: 400 }));
+    b.send(live(1, [1], blob(1)));
+    b.send(live(1, [1], blob(3), { important: true, stale: 400 }));
     await eventually(async () => (await sender.items()).length === 2);
     const [u, v] = await sender.items();
     expect(u).toMatchObject({ token: CARD_1, env: 'production', priority: 5, pushType: 'liveactivity' });
     expect(aps(u)).toEqual({
       timestamp: NOW_S,
       event: 'update',
-      'content-state': { v: 1, sealed: b64(blob(1)), e: 1, card: NOW_S - 100, via: 'internet' },
+      'content-state': { v: 2, record: b64(blob(1)), card: NOW_S - 100 },
       'stale-date': NOW_S + 360,
     });
     expect(v.priority).toBe(10);
     expect(aps(v)['stale-date']).toBe(NOW_S + 400);
   });
 
-  it('the content state for the vector blob carries the vector sealed content', async () => {
-    const b = await board();
-    await registered(b, { activityToken: CARD_1, startToken: START_1 });
-    const sender = await fakeSender(b.id);
-    b.send(live(1, [[1, VECTOR_BLOB]]));
-    await eventually(async () => (await sender.items()).length === 1);
-    expect(aps((await sender.items())[0])['content-state']).toEqual({ v: 1, sealed: VECTOR_SEALED, e: 1, via: 'internet' });
-  });
-
   it('an update to a phone without a card starts one, once per run', async () => {
     const b = await board();
     await registered(b);
     const sender = await fakeSender(b.id);
-    b.send(live(1, [[2, blob(2)]]));
+    b.send(live(1, [2], blob(2)));
     await eventually(async () => (await sender.items()).length === 1);
     expect((await sender.items())[0]).toMatchObject({ token: START_2 });
     expect(aps((await sender.items())[0]).event).toBe('start');
-    b.send(live(1, [[2, blob(2)]]));
-    b.send(live(1, [[2, blob(2)]], { run: RUN + 1 }));
+    b.send(live(1, [2], blob(2)));
+    b.send(live(1, [2], blob(2), { run: RUN + 1 }));
     await eventually(async () => (await sender.items()).length === 2);
     expect(await b.quiet(100)).toBe(true);
     expect(await sender.items()).toHaveLength(2);
@@ -249,14 +226,14 @@ describe('LIVE to Live Activity pushes', () => {
     const b = await board();
     await registered(b, { startToken: START_1, activityToken: CARD_1, activityStartedAt: NOW_S - 100 });
     const sender = await fakeSender(b.id);
-    b.send(live(2, [[1, blob(1)], [2, blob(2)]], { dismissal: 900 }));
+    b.send(live(2, [1, 2], blob(1), { dismissal: 900 }));
     await eventually(async () => (await sender.items()).length === 1);
     const [e] = await sender.items();
     expect(e).toMatchObject({ token: CARD_1, priority: 10, expiration: NOW_S + 8 * 3600 });
     expect(aps(e)).toEqual({
       timestamp: NOW_S,
       event: 'end',
-      'content-state': { v: 1, sealed: b64(blob(1)), e: 2, card: NOW_S - 100, via: 'internet' },
+      'content-state': { v: 2, record: b64(blob(1)), card: NOW_S - 100 },
       'dismissal-date': NOW_S + 900,
     });
     expect(toHex(await b.next())).toBe('0008000006');
@@ -267,7 +244,7 @@ describe('LIVE to Live Activity pushes', () => {
     const b = await board();
     await registered(b, { startToken: START_1, activityToken: CARD_1 });
     await fakeSender(b.id, () => 'failed');
-    b.send(live(2, [[1, blob(1)]]));
+    b.send(live(2, [1], blob(1)));
     expect(await b.quiet(100)).toBe(true);
     expect((await row(b.id, 1)).activity_token).toBe(CARD_1);
   });
@@ -276,10 +253,10 @@ describe('LIVE to Live Activity pushes', () => {
     const b = await board();
     await registered(b, { startToken: START_1, activityToken: CARD_1 });
     await fakeSender(b.id, () => 'gone');
-    b.send(live(1, [[1, blob(1)]]));
+    b.send(live(1, [1], blob(1)));
     expect(toHex(await b.next())).toBe('0008000006');
     expect(await row(b.id, 1)).toMatchObject({ activity_token: null, start_token: START_1 });
-    b.send(live(1, [[1, blob(1)]]));
+    b.send(live(1, [1], blob(1)));
     expect(toHex(await b.next())).toBe('0008000004');
     expect(await row(b.id, 1)).toBeUndefined();
   });
@@ -290,7 +267,7 @@ describe('LIVE to Live Activity pushes', () => {
     await fakeSender(b.id);
     const log = vi.spyOn(console, 'log');
     b.send(new Uint8Array([0, 7, 1, 0]));
-    b.send(live(1, [[1, blob(1)], [2, blob(2)]], { starter: 1 }));
+    b.send(live(1, [1, 2], blob(1), { starter: 1 }));
     await eventually(() => logged(log).some((l) => l.includes('live update')));
     expect(b.ws.readyState).toBe(WebSocket.OPEN);
     const lines = logged(log);
@@ -300,7 +277,6 @@ describe('LIVE to Live Activity pushes', () => {
         board: b.id,
         event: 'live update',
         slots: [1, 2],
-        starter: 1,
         sends: [
           { push: 'update', to: 'activity', env: 'production', outcome: 'sent' },
           { push: 'start', to: 'start', env: 'sandbox', outcome: 'sent' },
@@ -316,10 +292,10 @@ describe('a run that ended', () => {
     const b = await board();
     await registered(b);
     const sender = await fakeSender(b.id);
-    b.send(live(0, [[2, blob(2)]]));
+    b.send(live(0, [2], blob(2)));
     await eventually(async () => (await sender.items()).length === 1);
     await at(b, NOW + 8000);
-    b.send(live(2, [[2, blob(4)]], { dismissal: 300 }));
+    b.send(live(2, [2], blob(4), { dismissal: 300 }));
     await eventually(async () => (await meta(b.id, 'live_ended')) === NOW_S + 8);
     await at(b, NOW + 30_000);
     const reg = { env: 'sandbox', startToken: START_2, iosVersion: '18.1' };
@@ -331,7 +307,7 @@ describe('a run that ended', () => {
     expect(aps(e)).toEqual({
       timestamp: NOW_S + 30,
       event: 'end',
-      'content-state': { v: 1, sealed: b64(blob(4)), e: 2, card: NOW_S, via: 'internet' },
+      'content-state': { v: 2, record: b64(blob(4)), card: NOW_S },
       'dismissal-date': NOW_S + 8 + 300,
     });
     expect(toHex(await b.next())).toBe('0008000006');
@@ -348,18 +324,18 @@ describe('the 8-hour renewal', () => {
     const b = await board();
     await registered(b, { startToken: START_1, activityToken: CARD_1, activityStartedAt: NOW_S - RENEW_AFTER_S + 1, iosVersion: '18.0' });
     const sender = await fakeSender(b.id);
-    b.send(live(1, [[1, blob(1)]]));
+    b.send(live(1, [1], blob(1)));
     await eventually(async () => (await sender.items()).length === 1);
     expect(aps((await sender.items())[0]).event).toBe('update');
 
     await at(b, NOW + 20_000);
-    b.send(live(1, [[1, blob(2)]]));
+    b.send(live(1, [1], blob(2)));
     await eventually(async () => (await sender.items()).length === 3);
     const [, start, end] = await sender.items();
     expect(start).toMatchObject({ token: START_1, priority: 10 });
     expect(aps(start)).toMatchObject({
       event: 'start',
-      'content-state': { v: 1, sealed: b64(blob(2)), e: 1, card: NOW_S + 20, via: 'internet', relay: { renewed: true } },
+      'content-state': { v: 2, record: b64(blob(2)), card: NOW_S + 20, relay: { renewed: true } },
       alert: { title: 'Flamekeeper', body: { 'loc-key': 'card.renewed' } },
       'input-push-token': 1,
     });
@@ -369,7 +345,7 @@ describe('the 8-hour renewal', () => {
     expect(await row(b.id, 1)).toMatchObject({ activity_token: null, no_start_run: RUN });
 
     // No second card in this run before the app registers the new one.
-    b.send(live(1, [[1, blob(3)]]));
+    b.send(live(1, [1], blob(3)));
     expect(await b.quiet(100)).toBe(true);
     expect(await sender.items()).toHaveLength(3);
   });
@@ -378,7 +354,7 @@ describe('the 8-hour renewal', () => {
     const b = await board();
     await registered(b, { startToken: START_1, activityToken: CARD_1, activityStartedAt: NOW_S - RENEW_AFTER_S });
     const sender = await fakeSender(b.id, () => 'failed');
-    b.send(live(1, [[1, blob(1)]]));
+    b.send(live(1, [1], blob(1)));
     await eventually(async () => (await sender.items()).length === 1);
     expect(await b.quiet(100)).toBe(true);
     expect((await sender.items()).map((i) => i.token)).toEqual([START_1]);
@@ -389,7 +365,7 @@ describe('the 8-hour renewal', () => {
     const b = await board();
     await registered(b, { activityToken: CARD_1, activityStartedAt: NOW_S - RENEW_AFTER_S - 10 });
     const sender = await fakeSender(b.id);
-    b.send(live(1, [[1, blob(1)]]));
+    b.send(live(1, [1], blob(1)));
     await eventually(async () => (await sender.items()).length === 1);
     expect(aps((await sender.items())[0]).event).toBe('update');
   });
@@ -401,7 +377,7 @@ describe('lost contact', () => {
     const b = await board();
     await registered(b, { startToken: START_1, activityToken: CARD_1, activityStartedAt: NOW_S - 100, device: 'bb'.repeat(32), offlineAfter });
     const sender = await fakeSender(b.id);
-    b.send(live(1, [[1, blob(9)]]));
+    b.send(live(1, [1], blob(9)));
     await eventually(async () => (await sender.items()).length === 1);
     await at(b, NOW + 1000);
     b.ws.close(1000);
@@ -423,7 +399,7 @@ describe('lost contact', () => {
     expect(aps(u)).toEqual({
       timestamp: (gone + 10 * MIN) / 1000,
       event: 'update',
-      'content-state': { v: 1, sealed: b64(blob(9)), e: 1, card: NOW_S - 100, via: 'internet', relay: { lostAt: NOW_S + 1 } },
+      'content-state': { v: 2, record: b64(blob(9)), card: NOW_S - 100, relay: { lostAt: NOW_S + 1 } },
       'stale-date': (gone + 10 * MIN) / 1000,
     });
     expect(await alarmTime(b.id)).toBe(gone + 60 * MIN);
@@ -472,6 +448,8 @@ describe('keepalive', () => {
     const b = await board();
     await registered(b, { startToken: START_1, activityToken: CARD_1, activityStartedAt: NOW_S - 100 });
     const sender = await fakeSender(b.id);
+    b.send(live(1, [1], blob(9)));
+    await eventually(async () => (await sender.items()).length === 1);
     const app = await fakeApp(b.id, T1);
     expect(toHex(await b.next())).toBe('00040101');
     expect(SILENT_MS).toBe(2 * MIN);
@@ -486,6 +464,6 @@ describe('keepalive', () => {
     // Lost contact runs from the last keepalive.
     expect(await alarmTime(b.id)).toBe(NOW + 45_000 + 10 * MIN);
     await alarmAt(b.id, NOW + 45_000 + 10 * MIN);
-    expect(aps((await sender.items())[0])['content-state']).toMatchObject({ relay: { lostAt: NOW_S + 45 } });
+    expect(aps((await sender.items())[1])['content-state']).toMatchObject({ record: b64(blob(9)), relay: { lostAt: NOW_S + 45 } });
   });
 });
