@@ -20,8 +20,6 @@ export type MetaKey =
   /** Lost contact in this absence: 1 the update went out, 2 the cards were ended. */
   | 'lost_stage';
 
-/** The slots with a device token, with a live card and with a push-to-start token, a bit each. */
-export type Masks = { push: number; live: number; start: number };
 
 const TOKEN_COLUMN: Record<TokenKind, string> = { device: 'device', start: 'start_token', activity: 'activity_token' };
 
@@ -100,16 +98,6 @@ export class Store {
 
   registration(slot: number): Registration | null {
     return this.sql.exec<Registration>(`SELECT * FROM registration WHERE slot = ?`, slot).toArray()[0] ?? null;
-  }
-
-  masks(): Masks {
-    const m: Masks = { push: 0, live: 0, start: 0 };
-    for (const r of this.registrations()) {
-      if (r.device) m.push |= 1 << r.slot;
-      if (r.activity_token) m.live |= 1 << r.slot;
-      if (r.start_token) m.start |= 1 << r.slot;
-    }
-    return m;
   }
 
   /**

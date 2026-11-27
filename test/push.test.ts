@@ -51,16 +51,13 @@ function aps(p: Record<string, unknown>): Aps {
 async function boardWithPhones(): Promise<FakeBoardSocket> {
   const b = await fakeBoard();
   await b.signIn();
-  b.roster([
+  await b.roster([
     [1, await sha256(T1)],
     [2, H],
   ]);
-  expect(toHex(await b.next())).toBe('0008000000');
   await setClock(b.id, NOW);
   expect((await register(b.id, T1, { env: 'production', device: DEVICE_1 })).status).toBe(204);
-  expect(toHex(await b.next())).toBe('0008020000');
   expect((await register(b.id, T, { env: 'sandbox', device: DEVICE_2 })).status).toBe(204);
-  expect(toHex(await b.next())).toBe('0008060000');
   return b;
 }
 
@@ -113,7 +110,7 @@ describe('APNs message for a blob', () => {
       sound: 'default',
       'thread-id': ID,
     });
-    expect(m.payload.fk).toEqual({ v: 1, b: ID, d: base64(b) });
+    expect(m.payload.fk).toEqual({ b: ID, d: base64(b) });
     const d = atob((m.payload.fk as { d: string }).d);
     expect(toHex(Uint8Array.from(d, (c) => c.charCodeAt(0)))).toBe(PUSH_BLOB);
   });
@@ -161,7 +158,6 @@ describe('PUSH fan-out', () => {
   it('skips a slot whose registration has no device', async () => {
     const b = await boardWithPhones();
     expect((await register(b.id, T1, { env: 'production', startToken: 'cc'.repeat(32) })).status).toBe(204);
-    expect(toHex(await b.next())).toBe('0008040002');
     const sender = await fakeSender(b.id);
     b.send(pushMessage(1, [[1, blob(1)], [2, blob(2)]]));
     await eventually(async () => (await sender.items()).length === 1);
@@ -173,7 +169,7 @@ describe('PUSH fan-out', () => {
     const b = await boardWithPhones();
     const sender = await fakeSender(b.id, (i) => (i.token === DEVICE_1 ? 'gone' : 'sent'));
     b.send(pushMessage(1, [[1, blob(1)], [2, blob(2)]]));
-    expect(toHex(await b.next())).toBe('0008040000');
+    await eventually(async () => (await rows(b.id, 'registration')).length === 1);
     expect((await rows(b.id, 'registration')).map((r) => r.slot)).toEqual([2]);
     expect((await sender.items()).length).toBe(2);
   });

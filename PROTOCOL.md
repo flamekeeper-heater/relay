@@ -32,19 +32,19 @@ the relay answers the text `ping` with the text `pong`, on any socket, signed in
 | Message | Bytes |
 |---|---|
 | CHALLENGE relay → board | `00 01` ‖ 32 random bytes |
-| AUTH board → relay | `00 02` ‖ public key (65, uncompressed) ‖ signature r ‖ s (64, not DER) ‖ u8 n ‖ firmware version (n ≤ 32, UTF-8) |
-| signed bytes (ECDSA P-256, SHA-256) | `"fk1 relay board"` ‖ challenge ‖ u8 host length ‖ host (as the board dialled it, with `:port` if any) ‖ u8 n ‖ firmware version |
-| ROSTER board → relay | `00 03` ‖ u8 format 1 ‖ n × (u8 slot 0-7, SHA-256(T) 32 bytes); n ≤ 8, slots unique; replaces the stored roster |
+| AUTH board → relay | `00 02` ‖ public key (65, uncompressed) ‖ signature r ‖ s (64, not DER): exactly 131 bytes |
+| signed bytes (ECDSA P-256, SHA-256) | `"fk1 relay board"` ‖ challenge ‖ u8 host length ‖ host (as the board dialled it, with `:port` if any) |
+| ROSTER board → relay | `00 03` ‖ n × (u8 slot 0-7, SHA-256(T) 32 bytes); n ≤ 8, slots unique; replaces the stored roster |
 | OPEN relay → board | `00 04` ‖ u8 channel 1-3 ‖ u8 slot |
 | CLOSE both ways | `00 05` ‖ u8 channel ‖ u16 close code |
 | PUSH board → relay | `00 06` ‖ u8 class 0-3 ‖ u8 n ≤ 8 ‖ n × (u8 slot 0-7, u8 length ≥ 28, blob); slots unique |
-| LIVE board → relay | `00 07` ‖ u8 event (0 start, 1 update, 2 end) ‖ u8 flags (bit 0 important, bit 1 fault end) ‖ u16 stale s ‖ u16 dismissal s ‖ u8 starter slot (0xFF none) ‖ u32 run id (never 0, the same for every LIVE of one run, another for the next run) ‖ u8 slots (a bit per slot: the phones this LIVE is for) ‖ the record (1-64 bytes, not sealed; the relay does not read it). The starter slot is not used by the relay |
-| WANT relay → board | `00 08` ‖ u8 slots with a device token ‖ u8 slots with a live card ‖ u8 slots with a push-to-start token; a bit per slot |
+| LIVE board → relay | `00 07` ‖ u8 event (0 start, 1 update, 2 end) ‖ u8 flags (bit 0 important; bit 1, on an end, the run ended after a fault or an alert) ‖ u32 run id (never 0, the same for every LIVE of one run, another for the next run) ‖ u8 slots (a bit per slot: the phones this LIVE is for) ‖ the record (1-64 bytes, not sealed; the relay does not read it) |
 | app frame | u8 channel 1-3 ‖ the app protocol frame, unchanged |
 
 **Board:** the relay sends CHALLENGE; the board answers AUTH within 10 s (the key must hash to the
 id, the signature must cover this connection's challenge and host), then sends ROSTER. The relay
-answers AUTH and every ROSTER with WANT, and sends WANT again whenever the registered slots change.
+sends nothing back for either: it takes each before the board's next message, so a PUSH or LIVE
+right behind them is read against the new roster.
 A newer board socket that signs in replaces the older one. Once signed in, the board sends `ping`
 at least every 45 s; a board the relay has not heard a `ping` from for 120 s (from its sign-in, then
 from its last one) is taken as gone: closed with 1001, last seen at its last `ping`.
@@ -118,7 +118,7 @@ body too large; 501 `push not available` (a relay without APNs secrets).
 The board encrypts one blob per phone; the relay adds that phone's device token and sends it to
 APNs. Every request has `apns-push-type: alert`, `apns-expiration` now + 24 h, `apns-topic` the
 `BUNDLE_ID` var, title "Flamekeeper", `mutable-content: 1` and `thread-id` the board id. The custom
-key `fk` is `{v: 1, b: <board id>, d: <blob, base64>}` for a PUSH; the app's extension decrypts the
+key `fk` is `{b: <board id>, d: <blob, base64>}` for a PUSH; the app's extension decrypts the
 blob and replaces the fixed text.
 
 | Class | APNs priority | Interruption level | Sound | Fixed text |
@@ -130,7 +130,7 @@ blob and replaces the fixed text.
 | offline | 10 | active | `default` | A heater is offline. Open Flamekeeper. |
 
 The relay sends the last one itself, once per absence, when a registration's `offlineAfter` has
-passed since the board was last seen. Its `fk` is `{v: 1, b, k: "offline", t: <UTC seconds last
+passed since the board was last seen. Its `fk` is `{b, k: "offline", t: <UTC seconds last
 seen>}`, not encrypted, and it carries `apns-collapse-id: <board id>-offline`. APNs tokens reported
 dead (410, `BadDeviceToken`, `DeviceTokenNotForTopic`) are deleted.
 
@@ -147,7 +147,7 @@ late end:
 |---|---|---|
 | start or update, the phone has a card | `update` | its card's token |
 | start or update, no card | `start` (push-to-start) | its start token; not to a phone that swiped its card away in this run, and once per run |
-| end | `end`, `dismissal-date` now + the board's dismissal s; the card's token is then dropped | its card's token |
+| end | `end`, `dismissal-date` now + 900 s after a fault end (flags bit 1), else now + 300 s; the card's token is then dropped | its card's token |
 | a card token registered after its run ended, for a card that started before the end | `end` at once, `dismissal-date` the run's | that token |
 | an update 7 h 45 min after the card started | `start` with `relay.renewed`; once APNs took it, `end` (dismissal now) to the old card | start token, card token |
 | board away 10 min | `update` with `relay.lostAt` (when the board was last seen) and the last record | card tokens |
@@ -158,12 +158,12 @@ in the other environment; if that one takes it, the relay keeps sending that tok
 hand a development build the Live Activity tokens of a production install). A card token registered
 after a start is tried first where that start went. The device token always uses `env`.
 
-`aps`: `timestamp` (now), `event`, `content-state`, `stale-date` (now + the board's stale s) for
+`aps`: `timestamp` (now), `event`, `content-state`, `stale-date` (now + 360 s) for
 start and update; a push-to-start adds `attributes-type: "HeaterActivityAttributes"`, `attributes:
 {board: <board id>}`, `alert: {title: "Flamekeeper", body: {loc-key: "card.started"}}` (no sound;
 `card.renewed` for a renewal)
 and, for iOS 18 or later, `input-push-token: 1`. Priority 10 for start, end and important updates,
-else 5. The content state is `{v: 2, record: <the record, base64>, card: <the card's start, UTC s>,
+else 5. The content state is `{record: <the record, base64>, card: <the card's start, UTC s>,
 relay?: {lostAt} | {renewed: true}}`.
 
 ## Test vectors
@@ -177,10 +177,9 @@ The firmware and the app test against the same values.
 | Wi-Fi key secret | `09` × 32 |
 | relay token T | `16c1df6a87aaeae336a68c3cb93442b2246922a2edaee096e2439ee205578c0a` |
 | SHA-256(T) | `d91429cfba5c46b38cfeb129eb4f263b616323ad4d7c20aeb3430d641258e834` |
-| signed bytes (challenge `01` × 32, host `relay.flamekeeper.app`, version `1.4.0`) | `666b312072656c617920626f61726401010101010101010101010101010101010101010101010101010101010101011572656c61792e666c616d656b65657065722e61707005312e342e30` |
-| ROSTER (slot 2) | `00030102d91429cfba5c46b38cfeb129eb4f263b616323ad4d7c20aeb3430d641258e834` |
-| WANT (slot 2 in every mask) | `0008040404` |
-| LIVE start (slot 2, starter 2, run 42, stale 360, the record `d0`…`f0`, 33 bytes) | `0007000168010000022a00000004d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0` |
-| LIVE update | `0007010068010000022a00000004d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0` |
-| LIVE end (fault end, dismissal 900) | `0007020368018403022a00000004d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0` |
+| signed bytes (challenge `01` × 32, host `relay.flamekeeper.app`) | `666b312072656c617920626f61726401010101010101010101010101010101010101010101010101010101010101011572656c61792e666c616d656b65657065722e617070` |
+| ROSTER (slot 2) | `000302d91429cfba5c46b38cfeb129eb4f263b616323ad4d7c20aeb3430d641258e834` |
+| LIVE start (slot 2, run 42, the record `d0`…`eb`, 28 bytes) | `000700012a00000004d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaeb` |
+| LIVE update | `000701002a00000004d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaeb` |
+| LIVE end (fault end) | `000702032a00000004d0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaeb` |
 | PUSH (class 1, slot 2) | `000601010253c0c1c2c3c4c5c6c7c8c9cacb4876b3e19822be890adb585de818669c2c976e95c2954fd98602d395ed91fa37070d498a90e599316ce1c94aa597c5658e883dca81b7903a416591331330ae3f75cf565b785d73` |

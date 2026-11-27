@@ -18,8 +18,16 @@ export const LOST_END_S = 3600;
 const LOST_DISMISSAL_S = 900;
 /** How long APNs keeps an end for a phone that is off; starts and updates keep until they would be stale. */
 const END_EXPIRY_S = 8 * 3600;
-/** The stale time when the board gives none. */
-const DEFAULT_STALE_S = 360;
+/** A start or an update goes grey this long after it was sent. */
+const STALE_S = 360;
+/** How long a run's final card stays on the Lock Screen: longer after a fault or an alert. */
+const END_DISMISSAL_S = 300;
+const FAULT_END_DISMISSAL_S = 900;
+
+/** The final card's dismissal for a LIVE end. */
+export function endDismissalS(l: Live): number {
+  return l.faultEnd ? FAULT_END_DISMISSAL_S : END_DISMISSAL_S;
+}
 const IOS_INPUT_PUSH_TOKEN = 18;
 /** The card's ActivityKit attributes type, and the app's localized texts for a new and a renewed card. */
 const ATTRIBUTES_TYPE = 'HeaterActivityAttributes';
@@ -30,13 +38,12 @@ type RelayNote = { lostAt: number } | { renewed: true };
 
 /** The card's content state (`LiveContent` in the app): the record, the card's start, the relay's note. */
 function contentState(record: Uint8Array, card: number | null, relay?: RelayNote): ApnsPayload {
-  return { v: 2, record: base64(record), ...(card === null ? {} : { card }), ...(relay ? { relay } : {}) };
+  return { record: base64(record), ...(card === null ? {} : { card }), ...(relay ? { relay } : {}) };
 }
 
 /** The requests for one LIVE: per registered phone it is for. */
 export function liveRequests(l: Live, rows: Registration[], boardId: string, nowS: number): Send[] {
   const out: Send[] = [];
-  const staleS = l.staleS || DEFAULT_STALE_S;
   const priority = l.important || l.event !== LiveEvent.update ? 10 : 5;
   for (const r of rows) {
     const slot = r.slot;
@@ -46,12 +53,12 @@ export function liveRequests(l: Live, rows: Registration[], boardId: string, now
       slot,
       kind: 'start',
       event: 'start',
-      item: startItem(r, contentState(l.record, nowS, relay), boardId, nowS, staleS),
+      item: startItem(r, contentState(l.record, nowS, relay), boardId, nowS, STALE_S),
       after: 'started',
       run: l.run,
     });
     if (l.event === LiveEvent.end) {
-      if (r.activity_token) out.push(end(r, content, nowS, l.dismissalS));
+      if (r.activity_token) out.push(end(r, content, nowS, endDismissalS(l)));
     } else if (!r.activity_token) {
       // No card: start one, unless this phone was already sent a start or swiped its card away in this run.
       if (r.start_token && r.no_start_run !== l.run) out.push(start());
@@ -59,7 +66,7 @@ export function liveRequests(l: Live, rows: Registration[], boardId: string, now
       // A renewal: the new card, and once APNs took it the old one goes at once.
       out.push({ ...start({ renewed: true }), next: end(r, content, nowS, 0) });
     } else {
-      out.push({ slot, kind: 'activity', event: 'update', item: updateItem(r, content, nowS, staleS, priority) });
+      out.push({ slot, kind: 'activity', event: 'update', item: updateItem(r, content, nowS, STALE_S, priority) });
     }
   }
   return out;

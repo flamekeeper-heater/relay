@@ -5,7 +5,7 @@ import type { Env as RelayEnv } from '../src/index';
 import { TOKEN_MIN_S, TOKEN_REUSE_S } from '../src/push/apns';
 import { type PushSender, outcomeOf } from '../src/push/pushSender';
 import type { ApnsItem } from '../src/push/types';
-import { hex, toHex } from './bytes';
+import { hex } from './bytes';
 import { eventually, fakeBoard, logged, register, rows, testKey } from './fakes';
 
 const T = hex('16c1df6a87aaeae336a68c3cb93442b2246922a2edaee096e2439ee205578c0a');
@@ -166,12 +166,9 @@ describe('APNs sender', () => {
     await fakeApns(() => [410, 'Unregistered']);
     const b = await fakeBoard();
     await b.signIn();
-    b.roster([[2, H]]);
-    await b.next();
+    await b.roster([[2, H]]);
     expect((await register(b.id, T, { env: 'sandbox', device: 'aa'.repeat(32) })).status).toBe(204);
-    expect(toHex(await b.next())).toBe('0008040000');
     b.send(new Uint8Array([0, 6, 1, 1, 2, 40, ...new Uint8Array(40).fill(7)]));
-    expect(toHex(await b.next())).toBe('0008000000');
     await eventually(async () => (await rows(b.id, 'registration')).length === 0);
   });
 });

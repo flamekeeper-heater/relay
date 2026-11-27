@@ -34,11 +34,12 @@ export interface FakeBoardSocket extends FakeSocket {
   id: string;
   publicKey: Uint8Array;
   keys: CryptoKeyPair;
-  /** Answers the relay's CHALLENGE and resolves at the relay's WANT (hex), which follows a good AUTH. */
-  signIn(want?: string): Promise<void>;
+  /** Answers the relay's CHALLENGE and resolves once the room has taken the AUTH. */
+  signIn(): Promise<void>;
   /** The AUTH message for a challenge, signed over `host`. */
   auth(challenge: Uint8Array, host?: string): Promise<Uint8Array>;
-  roster(entries: Array<[slot: number, hash: Uint8Array]>): void;
+  /** Sends a ROSTER and resolves once the room has stored it. */
+  roster(entries: Array<[slot: number, hash: Uint8Array]>): Promise<void>;
 }
 
 export type FakeAppSocket = FakeSocket;
@@ -57,6 +58,14 @@ export function randomId(): string {
 
 export function room(id: string): DurableObjectStub<BoardRoom> {
   return env.BOARD.getByName(id);
+}
+
+/** Whether the room has taken the latest AUTH: a board is signed in and no open board socket waits for its AUTH. */
+function signedIn(id: string): Promise<boolean> {
+  return runInDurableObject(room(id), (_o: BoardRoom, state) => {
+    const open = state.getWebSockets('board').filter((w) => w.readyState === WebSocket.OPEN);
+    return open.length > 0 && open.every((w) => (w.deserializeAttachment() as { authedAt: number | null }).authedAt !== null);
+  });
 }
 
 /** Connects through the Worker, or straight to a room (`via`, e.g. one not made by board id). */
@@ -127,20 +136,18 @@ export async function testKey(): Promise<{ pem: string; publicKey: CryptoKey }> 
 }
 
 export async function fakeBoard(
-  o: { host?: string; firmware?: string; keyOf?: CryptoKeyPair; id?: string; via?: DurableObjectStub<BoardRoom> } = {},
+  o: { host?: string; keyOf?: CryptoKeyPair; id?: string; via?: DurableObjectStub<BoardRoom> } = {},
 ): Promise<FakeBoardSocket> {
   const keys = o.keyOf ?? (await newKeys());
   const publicKey = new Uint8Array((await crypto.subtle.exportKey('raw', keys.publicKey)) as ArrayBuffer);
   const id = o.id ?? (await boardIdOf(publicKey));
   const host = o.host ?? HOST;
-  const firmware = o.firmware ?? '1.4.0';
   const s = await connect(`/v1/board/${id}`, host, o.via);
 
   async function auth(challenge: Uint8Array, signedHost = host): Promise<Uint8Array> {
-    const signed = authSignedBytes(challenge, signedHost, firmware);
+    const signed = authSignedBytes(challenge, signedHost);
     const sig = new Uint8Array(await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, keys.privateKey, signed));
-    const fw = new TextEncoder().encode(firmware);
-    return concat(new Uint8Array([0, Op.auth]), publicKey, sig, new Uint8Array([fw.length]), fw);
+    return concat(new Uint8Array([0, Op.auth]), publicKey, sig);
   }
 
   return {
@@ -149,17 +156,16 @@ export async function fakeBoard(
     publicKey,
     keys,
     auth,
-    async signIn(expected = '0008000000') {
+    async signIn() {
       const c = await s.next();
       if (c[0] !== 0 || c[1] !== Op.challenge || c.length !== 34) throw new Error('expected CHALLENGE');
       s.send(await auth(c.subarray(2)));
-      const want = await s.next();
-      if (toHex(want) !== expected) throw new Error(`expected WANT ${expected}, got ${toHex(want)}`);
+      await eventually(() => signedIn(id));
     },
-    roster(entries) {
-      s.send(
-        concat(new Uint8Array([0, Op.roster, 1]), ...entries.map(([slot, hash]) => concat(new Uint8Array([slot]), hash))),
-      );
+    async roster(entries) {
+      s.send(concat(new Uint8Array([0, Op.roster]), ...entries.map(([slot, hash]) => concat(new Uint8Array([slot]), hash))));
+      const want = entries.map(([slot, hash]) => `${slot}:${toHex(hash)}`).sort().join();
+      await eventually(async () => (await rows(id, 'roster')).map((r) => `${r.slot}:${toHex(new Uint8Array(r.hash as ArrayBuffer))}`).sort().join() === want);
     },
   };
 }

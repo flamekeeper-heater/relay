@@ -2,7 +2,7 @@ import { evictDurableObject } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { Close, encodeClose } from '../src/wire';
 import { concat, sha256, toHex } from './bytes';
-import { type FakeAppSocket, type FakeBoardSocket, attachments, fakeApp, fakeBoard, room, rows, setClock } from './fakes';
+import { type FakeAppSocket, type FakeBoardSocket, attachments, fakeApp, fakeBoard, room, setClock } from './fakes';
 
 interface Room {
   board: FakeBoardSocket;
@@ -14,9 +14,7 @@ async function boardRoom(): Promise<Room> {
   const tokens = Array.from({ length: 8 }, () => crypto.getRandomValues(new Uint8Array(32)));
   const board = await fakeBoard();
   await board.signIn();
-  board.roster(await Promise.all(tokens.map(async (t, slot) => [slot, await sha256(t)] as [number, Uint8Array])));
-  expect(toHex(await board.next())).toBe('0008000000'); // WANT, after the roster is stored
-  expect((await rows(board.id, 'roster')).length).toBe(8);
+  await board.roster(await Promise.all(tokens.map(async (t, slot) => [slot, await sha256(t)] as [number, Uint8Array])));
   return { board, tokens };
 }
 

@@ -16,6 +16,6 @@ export async function verifyBoardAuth(a: Auth, challenge: Uint8Array, host: stri
     { name: 'ECDSA', hash: 'SHA-256' },
     key,
     a.signature,
-    authSignedBytes(challenge, host, a.firmware),
+    authSignedBytes(challenge, host),
   );
 }

@@ -26,7 +26,7 @@ export const PONG = 'pong';
 /** The longest message the relay accepts either way (the board's frames are at most 1 + 1024 bytes). */
 export const MAX_MESSAGE = 2048;
 
-export const Op = { challenge: 1, auth: 2, roster: 3, open: 4, close: 5, push: 6, live: 7, want: 8 } as const;
+export const Op = { challenge: 1, auth: 2, roster: 3, open: 4, close: 5, push: 6, live: 7 } as const;
 
 export const Close = {
   /** The board sent no keepalive: taken as gone. */
@@ -49,56 +49,40 @@ export const CHALLENGE_BYTES = 32;
 export const TOKEN_BYTES = 32;
 const PUBLIC_KEY_BYTES = 65;
 const SIGNATURE_BYTES = 64;
-const FIRMWARE_MAX = 32;
+const AUTH_BYTES = 2 + PUBLIC_KEY_BYTES + SIGNATURE_BYTES;
 const HASH_BYTES = 32;
 const SLOTS = 8;
-const ROSTER_FORMAT = 1;
 const SIGNED_PREFIX = new TextEncoder().encode('fk1 relay board');
 
 export interface Auth {
   publicKey: Uint8Array;
   signature: Uint8Array;
-  firmware: string;
 }
 
 export function encodeChallenge(c: Uint8Array): Uint8Array {
   return concat(new Uint8Array([0, Op.challenge]), c);
 }
 
-/** `00 02` ‖ public key (65) ‖ signature r ‖ s (64) ‖ u8 n ‖ firmware version (n ≤ 32, UTF-8). */
+/** `00 02` ‖ public key (65) ‖ signature r ‖ s (64): exactly 131 bytes. */
 export function decodeAuth(m: Uint8Array): Auth | null {
-  const head = 2 + PUBLIC_KEY_BYTES + SIGNATURE_BYTES;
-  if (m.length < head + 1 || m[0] !== 0 || m[1] !== Op.auth) return null;
-  const n = m[head];
-  if (n > FIRMWARE_MAX || m.length !== head + 1 + n) return null;
-  let firmware: string;
-  try {
-    firmware = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(m.subarray(head + 1));
-  } catch {
-    return null;
-  }
-  return {
-    publicKey: m.slice(2, 2 + PUBLIC_KEY_BYTES),
-    signature: m.slice(2 + PUBLIC_KEY_BYTES, head),
-    firmware,
-  };
+  if (m.length !== AUTH_BYTES || m[0] !== 0 || m[1] !== Op.auth) return null;
+  return { publicKey: m.slice(2, 2 + PUBLIC_KEY_BYTES), signature: m.slice(2 + PUBLIC_KEY_BYTES) };
 }
 
-/** `"fk1 relay board"` ‖ challenge ‖ u8 host length ‖ host ‖ u8 n ‖ firmware version. */
-export function authSignedBytes(challenge: Uint8Array, host: string, firmware: string): Uint8Array {
+/** `"fk1 relay board"` ‖ challenge ‖ u8 host length ‖ host. */
+export function authSignedBytes(challenge: Uint8Array, host: string): Uint8Array {
   const h = new TextEncoder().encode(host);
-  const f = new TextEncoder().encode(firmware);
-  return concat(SIGNED_PREFIX, challenge, new Uint8Array([h.length]), h, new Uint8Array([f.length]), f);
+  return concat(SIGNED_PREFIX, challenge, new Uint8Array([h.length]), h);
 }
 
-/** `00 03` ‖ u8 format 1 ‖ n × (u8 slot 0-7, SHA-256(T) 32 bytes), n ≤ 8, slots unique. */
+/** `00 03` ‖ n × (u8 slot 0-7, SHA-256(T) 32 bytes), n ≤ 8, slots unique. */
 export function decodeRoster(m: Uint8Array): Map<number, Uint8Array> | null {
-  if (m.length < 3 || m[0] !== 0 || m[1] !== Op.roster || m[2] !== ROSTER_FORMAT) return null;
-  const body = m.length - 3;
+  if (m.length < 2 || m[0] !== 0 || m[1] !== Op.roster) return null;
+  const body = m.length - 2;
   const entry = 1 + HASH_BYTES;
   if (body % entry !== 0 || body / entry > SLOTS) return null;
   const roster = new Map<number, Uint8Array>();
-  for (let o = 3; o < m.length; o += entry) {
+  for (let o = 2; o < m.length; o += entry) {
     const slot = m[o];
     if (slot >= SLOTS || roster.has(slot)) return null;
     roster.set(slot, m.slice(o + 1, o + entry));
@@ -139,30 +123,19 @@ export function encodeOpen(channel: number, slot: number): Uint8Array {
   return new Uint8Array([0, Op.open, channel, slot]);
 }
 
-/**
- * WANT: the slots with a device token (alerts), with a live card (its update token) and that can
- * be sent a push-to-start (a start token), a bit per slot.
- */
-export function encodeWant(pushSlots: number, liveSlots: number, startSlots: number): Uint8Array {
-  return new Uint8Array([0, Op.want, pushSlots, liveSlots, startSlots]);
-}
-
 export const LiveEvent = { start: 0, update: 1, end: 2 } as const;
 /** The events' names, as APNs and the logs say them. */
 export const LIVE_EVENT_NAMES = ['start', 'update', 'end'] as const;
-const NO_STARTER = 0xff;
-const LIVE_HEAD = 14;
+const LIVE_HEAD = 9;
 /** The longest record a LIVE may carry; the relay passes it on unread. */
 const RECORD_MAX = 64;
 
 export interface Live {
   event: 0 | 1 | 2;
-  /** Flags bit 0: APNs priority 10. (Bit 1, a fault end, is the board's and the app's.) */
+  /** Flags bit 0: APNs priority 10. */
   important: boolean;
-  /** Seconds until the card goes grey. */
-  staleS: number;
-  /** For an end: seconds the final card stays. */
-  dismissalS: number;
+  /** Flags bit 1, on an end: the run ended after a fault or an alert (the final card stays longer). */
+  faultEnd: boolean;
   /** The board's id for this run, never 0. */
   run: number;
   /** The slots of the phones this LIVE is for, a bit each. */
@@ -171,23 +144,18 @@ export interface Live {
   record: Uint8Array;
 }
 
-/**
- * LIVE: `00 07` ‖ u8 event 0-2 ‖ u8 flags ‖ u16 stale s ‖ u16 dismissal s ‖ u8 starter slot
- * (0xFF none; not used by the relay) ‖ u32 run id (not 0) ‖ u8 slots ‖ the record (1-64 bytes).
- */
+/** LIVE: `00 07` ‖ u8 event 0-2 ‖ u8 flags ‖ u32 run id (not 0) ‖ u8 slots ‖ the record (1-64 bytes). */
 export function decodeLive(m: Uint8Array): Live | null {
   if (m.length <= LIVE_HEAD || m.length > LIVE_HEAD + RECORD_MAX || m[0] !== 0 || m[1] !== Op.live) return null;
   const event = m[2];
-  const starter = m[8];
-  const run = (m[9] | (m[10] << 8) | (m[11] << 16) | (m[12] << 24)) >>> 0;
-  if (event > LiveEvent.end || (starter >= SLOTS && starter !== NO_STARTER) || run === 0) return null;
+  const run = (m[4] | (m[5] << 8) | (m[6] << 16) | (m[7] << 24)) >>> 0;
+  if (event > LiveEvent.end || run === 0) return null;
   return {
     event: event as 0 | 1 | 2,
     important: (m[3] & 1) !== 0,
-    staleS: m[4] | (m[5] << 8),
-    dismissalS: m[6] | (m[7] << 8),
+    faultEnd: (m[3] & 2) !== 0,
     run,
-    slots: m[13],
+    slots: m[8],
     record: m.slice(LIVE_HEAD),
   };
 }

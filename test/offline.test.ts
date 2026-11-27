@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { apnsForOffline } from '../src/push/apnsMessage';
-import { hex, sha256, toHex } from './bytes';
+import { hex, sha256 } from './bytes';
 import { type FakeBoardSocket, alarmAt, alarmTime, eventually, fakeBoard, fakeSender, meta, register, rows, setClock } from './fakes';
 
 const T = hex('16c1df6a87aaeae336a68c3cb93442b2246922a2edaee096e2439ee205578c0a');
@@ -20,29 +20,24 @@ const DAY = 24 * 60 * MIN;
 async function awayWith(after1: number | null, after2: number) {
   const b = await fakeBoard();
   await b.signIn();
-  b.roster([
+  await b.roster([
     [1, await sha256(T1)],
     [2, H],
   ]);
-  expect(toHex(await b.next())).toBe('0008000000');
-  if (after1 !== null) {
-    expect((await register(b.id, T1, { env: 'production', device: DEVICE_1, offlineAfter: after1 })).status).toBe(204);
-    await b.next();
-  }
+  if (after1 !== null) expect((await register(b.id, T1, { env: 'production', device: DEVICE_1, offlineAfter: after1 })).status).toBe(204);
   expect((await register(b.id, T, { env: 'sandbox', device: DEVICE_2, offlineAfter: after2 })).status).toBe(204);
-  await b.next();
   const sender = await fakeSender(b.id);
   await setClock(b.id, T0);
   b.ws.close(1000);
   await b.closed;
   await eventually(async () => (await meta(b.id, 'last_seen')) === T0 / 1000);
-  return { b, sender, mask: after1 === null ? '0008040000' : '0008060000' };
+  return { b, sender };
 }
 
-async function backAt(b: FakeBoardSocket, ms: number, want: string): Promise<FakeBoardSocket> {
+async function backAt(b: FakeBoardSocket, ms: number): Promise<FakeBoardSocket> {
   await setClock(b.id, ms);
   const again = await fakeBoard({ keyOf: b.keys });
-  await again.signIn(want);
+  await again.signIn();
   return again;
 }
 
@@ -58,7 +53,7 @@ describe('heater offline watcher', () => {
           sound: 'default',
           'thread-id': ID,
         },
-        fk: { v: 1, b: ID, k: 'offline', t: 1_900_000_000 },
+        fk: { b: ID, k: 'offline', t: 1_900_000_000 },
       },
     });
   });
@@ -97,17 +92,17 @@ describe('heater offline watcher', () => {
   });
 
   it('a board back within the delay sends nothing', async () => {
-    const { b, sender, mask } = await awayWith(30, 30);
-    const again = await backAt(b, T0 + 10 * MIN, mask);
+    const { b, sender } = await awayWith(30, 30);
+    const again = await backAt(b, T0 + 10 * MIN);
     await alarmAt(b.id, T0 + 30 * MIN);
     expect(await again.quiet()).toBe(true);
     expect(await sender.items()).toEqual([]);
   });
 
   it('a board that comes back and leaves again is a new absence', async () => {
-    const { b, sender, mask } = await awayWith(null, 30);
+    const { b, sender } = await awayWith(null, 30);
     await alarmAt(b.id, T0 + 30 * MIN);
-    const again = await backAt(b, T0 + 40 * MIN, mask);
+    const again = await backAt(b, T0 + 40 * MIN);
     expect(await rows(b.id, 'registration')).toMatchObject([{ slot: 2, offline_sent: 0 }]);
     again.ws.close(1000);
     await again.closed;

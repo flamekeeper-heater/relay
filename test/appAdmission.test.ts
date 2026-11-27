@@ -27,9 +27,7 @@ function randomToken(): Uint8Array {
 async function boardWith(entries: Array<[number, Uint8Array]>, b?: FakeBoardSocket): Promise<FakeBoardSocket> {
   b ??= await fakeBoard();
   await b.signIn();
-  b.roster(entries);
-  expect(toHex(await b.next())).toBe('0008000000'); // WANT, after the roster is stored
-  expect((await rows(b.id, 'roster')).length).toBe(entries.length);
+  await b.roster(entries);
   return b;
 }
 
@@ -126,12 +124,11 @@ describe('app admission', () => {
       [2, await sha256(changed)],
       [5, H],
     ];
-    b.roster(next);
+    await b.roster(next);
     expect((await apps[1].closed).code).toBe(Close.notPaired);
     expect((await apps[2].closed).code).toBe(Close.notPaired);
     const told = [toHex(await b.next()), toHex(await b.next())].sort();
     expect(told).toEqual(['000502a30f', '000503a30f']);
-    expect(toHex(await b.next())).toBe('0008000000'); // WANT for the new roster
     expect(await apps[0].quiet()).toBe(true);
     const stored = await rows(b.id, 'roster');
     expect(stored.map((r) => [r.slot, toHex(new Uint8Array(r.hash as ArrayBuffer))])).toEqual(
@@ -139,14 +136,11 @@ describe('app admission', () => {
     );
   });
 
-  it('takes a ROSTER sent right behind AUTH, and answers each with WANT', async () => {
+  it('takes a ROSTER sent right behind AUTH', async () => {
     const b = await fakeBoard();
     const c = await b.next();
     b.send(await b.auth(c.subarray(2)));
-    b.roster([[2, H]]);
-    expect(toHex(await b.next())).toBe('0008000000'); // WANT after AUTH
-    expect(toHex(await b.next())).toBe('0008000000'); // WANT after ROSTER
-    expect((await rows(b.id, 'roster')).length).toBe(1);
+    await b.roster([[2, H]]);
     await fakeApp(b.id, T);
     expect(toHex(await b.next())).toBe('00040102');
   });

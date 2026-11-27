@@ -34,7 +34,7 @@ export function apnsForBlob(cls: 0 | 1 | 2 | 3, boardId: string, blob: Uint8Arra
   const sound = cls === 0 ? undefined : alarm ? CRITICAL_SOUND : 'default';
   return {
     priority: cls === 0 ? 5 : 10,
-    payload: { aps: aps(FIXED_TEXT[cls], alarm ? 'critical' : LEVEL[cls], sound, boardId), fk: { v: 1, b: boardId, d: base64(blob) } },
+    payload: { aps: aps(FIXED_TEXT[cls], alarm ? 'critical' : LEVEL[cls], sound, boardId), fk: { b: boardId, d: base64(blob) } },
   };
 }
 
@@ -45,7 +45,7 @@ export function apnsForBlob(cls: 0 | 1 | 2 | 3, boardId: string, blob: Uint8Arra
 export function apnsForOffline(boardId: string, seenS: number): AlertMessage {
   return {
     priority: 10,
-    payload: { aps: aps(OFFLINE_TEXT, 'active', 'default', boardId), fk: { v: 1, b: boardId, k: 'offline', t: seenS } },
+    payload: { aps: aps(OFFLINE_TEXT, 'active', 'default', boardId), fk: { b: boardId, k: 'offline', t: seenS } },
   };
 }
 

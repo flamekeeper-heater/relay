@@ -9,10 +9,10 @@ import { verifyBoardAuth } from './auth';
 import { fromHex, sha256, toHex } from './bytes';
 import { type Env, pushAvailable } from './index';
 import { type AlertMessage, apnsForBlob, apnsForOffline } from './push/apnsMessage';
-import { LOST_END_S, LOST_UPDATE_S, lateEndRequest, liveRequests, lostContactRequests } from './push/live';
+import { LOST_END_S, LOST_UPDATE_S, endDismissalS, lateEndRequest, liveRequests, lostContactRequests } from './push/live';
 import { REGISTRATION_MAX, parseBearer, parseCardEnd, parseRegistration } from './push/registry';
 import type { ApnsItem, ApnsOutcome, PushSend, Registration, Send } from './push/types';
-import { type Masks, Store } from './store';
+import { Store } from './store';
 import {
   CHALLENGE_BYTES,
   Close,
@@ -32,7 +32,6 @@ import {
   encodeChallenge,
   encodeClose,
   encodeOpen,
-  encodeWant,
   parsePath,
 } from './wire';
 
@@ -182,7 +181,7 @@ export class BoardRoom extends DurableObject<Env> {
       case Op.roster: {
         const roster = decodeRoster(m);
         if (!roster) closeSocket(ws, Close.policy, 'bad roster');
-        else this.setRoster(ws, roster);
+        else this.setRoster(roster);
         break;
       }
       case Op.close: {
@@ -224,7 +223,6 @@ export class BoardRoom extends DurableObject<Env> {
     // A new absence starts clean: the next one says "offline" and "lost contact" again.
     this.store.setMeta('lost_stage', null);
     this.store.setOfflineSent(this.store.registrations().map((r) => r.slot), false);
-    this.sendWant(ws);
     await this.scheduleAlarm();
     this.log('board in');
   }
@@ -239,30 +237,13 @@ export class BoardRoom extends DurableObject<Env> {
     return Math.max((attachment(board) as BoardSocket).authedAt ?? 0, this.pingAt(board) ?? 0);
   }
 
-  /**
-   * WANT: which slots have a device token, a live card and a push-to-start token. Sent after AUTH,
-   * after every ROSTER and when registrations change; the board replaces its masks with each one.
-   */
-  private sendWant(board: WebSocket): void {
-    const m = this.store.masks();
-    send(board, encodeWant(m.push, m.live, m.start));
-  }
-
-  /** WANT to the signed-in board if the masks differ from `before`. */
-  private wantIfChanged(before: Masks): void {
-    const now = this.store.masks();
-    const board = this.board();
-    if (board && (now.push !== before.push || now.live !== before.live || now.start !== before.start)) this.sendWant(board);
-  }
-
-  /** Stores a new roster, lets go of the phones whose slot left it or changed hash, then WANT. */
-  private setRoster(board: WebSocket, roster: Map<number, Uint8Array>): void {
+  /** Stores a new roster and lets go of the phones whose slot left it or changed hash. */
+  private setRoster(roster: Map<number, Uint8Array>): void {
     const changed = this.store.setRoster(roster);
     for (const ws of this.ctx.getWebSockets('app')) {
       const a = attachment(ws) as AppSocket;
       if (a.slot !== null && changed.has(a.slot)) this.closePhone(ws, a, Close.notPaired);
     }
-    this.sendWant(board);
   }
 
   /** The board sent no keepalive for `SILENT_MS`: its connection died without a close. */
@@ -386,7 +367,6 @@ export class BoardRoom extends DurableObject<Env> {
       await this.scheduleAlarm(); // a room no board signed in to keeps nothing
       return reply(401, 'Unauthorized');
     }
-    const before = this.store.masks();
     const old = this.store.registration(slot);
     let late: Send | null = null;
     if (role === 'cardEnd') {
@@ -411,7 +391,6 @@ export class BoardRoom extends DurableObject<Env> {
       this.log('registration set', { slot });
       if (r.activityToken && r.activityToken !== old?.activity_token) late = this.lateEnd(slot);
     }
-    this.wantIfChanged(before);
     if (late) await this.deliver('late end', [late]);
     // While the board is away, a new offline delay or a new card moves the room's deadlines.
     if (!this.board()) await this.scheduleAlarm();
@@ -464,7 +443,7 @@ export class BoardRoom extends DurableObject<Env> {
     // A card whose token comes only after its run ended is ended then (`lateEnd`).
     this.store.setMeta('live_run', ended ? null : l.run);
     this.store.setMeta('live_ended', ended ? nowS : null);
-    this.store.setMeta('live_end_until', ended ? nowS + l.dismissalS : null);
+    this.store.setMeta('live_end_until', ended ? nowS + endDismissalS(l) : null);
     this.store.setRecord(l.record);
     const sends = liveRequests(l, this.store.registrations(), this.id, nowS);
     const what = `live ${LIVE_EVENT_NAMES[l.event]}`;
@@ -525,8 +504,7 @@ export class BoardRoom extends DurableObject<Env> {
 
   /**
    * Hands the items to the APNs sender, then records what APNs said: a token it calls gone is
-   * forgotten, a card that ended too, a push-to-start that went out is noted; WANT if the masks
-   * changed. The log names each send's event, token kind, environment and outcome, nothing more.
+   * forgotten, a card that ended too, a push-to-start that went out is noted. The log names each send's event, token kind, environment and outcome, nothing more.
    */
   private async deliver(what: string, sends: Send[], more: Record<string, unknown> = {}): Promise<ApnsOutcome[]> {
     const outcomes = await this.send(sends.map((s) => s.item));
@@ -541,7 +519,6 @@ export class BoardRoom extends DurableObject<Env> {
       outcomes[i] = again[k];
       if (again[k] === 'sent') this.store.setTokenEnv(sends[i].slot, sends[i].kind as 'start' | 'activity', flipped[k].token, flipped[k].env);
     });
-    const before = this.store.masks();
     sends.forEach((s, i) => {
       const o = outcomes[i] ?? 'failed';
       // Only the token APNs refused or the card that ended: the phone may have registered a new one meanwhile.
@@ -549,7 +526,6 @@ export class BoardRoom extends DurableObject<Env> {
       if (o === 'sent' && s.after === 'started' && s.run !== undefined) this.store.setNoStart(s.slot, s.run);
     });
     this.log(what, { ...more, sends: sends.map((s, i) => ({ push: s.event, to: s.kind, env: s.item.env, outcome: outcomes[i] ?? 'failed' })) });
-    this.wantIfChanged(before);
     return outcomes;
   }
 
@@ -583,7 +559,7 @@ export class BoardRoom extends DurableObject<Env> {
     } else if (seen !== null) {
       next = Math.min(next, seen * 1000 + FORGET_MS, ...this.offlineWaiting().map((r) => offlineDue(r, seen)));
       const stage = this.store.meta('lost_stage') ?? 0;
-      if (stage < 2 && this.store.masks().live !== 0) next = Math.min(next, (seen + (stage < 1 ? LOST_UPDATE_S : LOST_END_S)) * 1000);
+      if (stage < 2 && this.store.registrations().some((r) => r.activity_token)) next = Math.min(next, (seen + (stage < 1 ? LOST_UPDATE_S : LOST_END_S)) * 1000);
     }
     if (next === Infinity) await this.store.wipe();
     else if ((await this.ctx.storage.getAlarm()) !== next) await this.ctx.storage.setAlarm(next);
